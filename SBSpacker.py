@@ -110,12 +110,7 @@ def process_single_eye_video(
     prev_tensor = torch.from_numpy(prev_frame_rgb).permute(2, 0, 1).float().div(255.0).to(hybrid_loop.device)
 
     prev_logits = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].to(hybrid_loop.device).float()
-    if prev_logits.shape[0] > 0:
-        prev_logits = prev_logits[0:1]
-    else:
-        h_mask = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].shape[2]
-        w_mask = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].shape[3]
-        prev_logits = torch.zeros((1, 1, h_mask, w_mask), device=hybrid_loop.device)
+    batch_size = len(tracker_state["obj_ids"])
 
     with torch.inference_mode():
         for frame_idx in tqdm(range(1, total_frames), desc="Processing Single Eye"):
@@ -139,19 +134,18 @@ def process_single_eye_video(
             flow_downscaled[0] *= (w_mask / width)
             flow_downscaled[1] *= (h_mask / height)
 
-            warped_logits = hybrid_loop.raft._warp_frame(prev_logits.squeeze(0), flow_downscaled)
-            warped_logits = warped_logits.unsqueeze(0)
+            warped_logits = hybrid_loop.raft._warp_frame(prev_logits, flow_downscaled)
 
             dummy_point_inputs = {
-                "point_coords": torch.zeros(1, 1, 2, device=hybrid_loop.device),
-                "point_labels": -torch.ones(1, 1, dtype=torch.int32, device=hybrid_loop.device)
+                "point_coords": torch.zeros(batch_size, 1, 2, device=hybrid_loop.device),
+                "point_labels": -torch.ones(batch_size, 1, dtype=torch.int32, device=hybrid_loop.device)
             }
 
             current_out, _ = hybrid_loop.predictor.model.tracker._run_single_frame_inference(
                 inference_state=tracker_state,
                 output_dict=tracker_state["output_dict"],
                 frame_idx=frame_idx,
-                batch_size=1,
+                batch_size=batch_size,
                 is_init_cond_frame=False,
                 point_inputs=dummy_point_inputs,
                 mask_inputs=None,
@@ -167,15 +161,11 @@ def process_single_eye_video(
             tracker_state["frames_already_tracked"][frame_idx] = {"reverse": False}
 
             prev_logits = current_out["pred_masks"].to(hybrid_loop.device).float()
-            if prev_logits.shape[0] > 0:
-                prev_logits = prev_logits[0:1]
-            else:
-                prev_logits = torch.zeros((1, 1, h_mask, w_mask), device=hybrid_loop.device)
             prev_tensor = curr_tensor
 
             logits_gpu = current_out["pred_masks_high_res"] if "pred_masks_high_res" in current_out else current_out["pred_masks"]
             if logits_gpu.shape[0] > 0:
-                logits_gpu = logits_gpu[0:1]
+                logits_gpu = torch.max(logits_gpu, dim=0, keepdim=True).values
             else:
                 logits_gpu = torch.zeros((1, 1, height, width), device=hybrid_loop.device)
             logits_resized = torch.nn.functional.interpolate(
@@ -250,15 +240,29 @@ class RaftMotionCompensator:
         return flow
 
     def _warp_frame(self, pt_frame, flow, t=1.0):
-        C, H, W = pt_frame.shape
-        flow_scaled = flow * t
-        y, x = torch.meshgrid(torch.arange(H, device=self.device), torch.arange(W, device=self.device), indexing='ij')
-        x_norm = 2.0 * (x + flow_scaled[0]) / max(W - 1, 1) - 1.0
-        y_norm = 2.0 * (y + flow_scaled[1]) / max(H - 1, 1) - 1.0
-        grid = torch.stack((x_norm, y_norm), dim=-1).unsqueeze(0)
-        return F.grid_sample(
-            pt_frame.unsqueeze(0), grid, mode='bilinear', padding_mode='border', align_corners=False
-        ).squeeze(0)
+        if pt_frame.ndim == 3:
+            C, H, W = pt_frame.shape
+            flow_scaled = flow * t
+            y, x = torch.meshgrid(torch.arange(H, device=self.device), torch.arange(W, device=self.device), indexing='ij')
+            x_norm = 2.0 * (x + flow_scaled[0]) / max(W - 1, 1) - 1.0
+            y_norm = 2.0 * (y + flow_scaled[1]) / max(H - 1, 1) - 1.0
+            grid = torch.stack((x_norm, y_norm), dim=-1).unsqueeze(0)
+            return F.grid_sample(
+                pt_frame.unsqueeze(0), grid, mode='bilinear', padding_mode='border', align_corners=False
+            ).squeeze(0)
+        elif pt_frame.ndim == 4:
+            N, C, H, W = pt_frame.shape
+            flow_scaled = flow * t
+            y, x = torch.meshgrid(torch.arange(H, device=self.device), torch.arange(W, device=self.device), indexing='ij')
+            x_norm = 2.0 * (x + flow_scaled[0]) / max(W - 1, 1) - 1.0
+            y_norm = 2.0 * (y + flow_scaled[1]) / max(H - 1, 1) - 1.0
+            grid = torch.stack((x_norm, y_norm), dim=-1).unsqueeze(0)
+            grid = grid.expand(N, -1, -1, -1)
+            return F.grid_sample(
+                pt_frame, grid, mode='bilinear', padding_mode='border', align_corners=False
+            )
+        else:
+            raise ValueError(f"Unexpected pt_frame dimensions: {pt_frame.ndim}")
 
     def stabilize_alpha_sequence(self, rgb_frames, alpha_masks, blend_weights=(0.2, 0.6, 0.2)):
         self._load_model()
@@ -405,12 +409,7 @@ class HybridSam3MotionLoop:
             tensors_rgb.append(t_rgb)
 
         prev_logits = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].to(self.device).float()
-        if prev_logits.shape[0] > 0:
-            prev_logits = prev_logits[0:1]
-        else:
-            h_mask = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].shape[2]
-            w_mask = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].shape[3]
-            prev_logits = torch.zeros((1, 1, h_mask, w_mask), device=self.device)
+        batch_size = len(tracker_state["obj_ids"])
 
         self.predictor.model.tracker.propagate_in_video_preflight(
             tracker_state, run_mem_encoder=True
@@ -435,19 +434,18 @@ class HybridSam3MotionLoop:
                 flow_downscaled[0] *= (w_mask / width)
                 flow_downscaled[1] *= (h_mask / height)
                 
-                warped_logits = self.raft._warp_frame(prev_logits.squeeze(0), flow_downscaled)
-                warped_logits = warped_logits.unsqueeze(0)
+                warped_logits = self.raft._warp_frame(prev_logits, flow_downscaled)
 
                 dummy_point_inputs = {
-                    "point_coords": torch.zeros(1, 1, 2, device=self.device),
-                    "point_labels": -torch.ones(1, 1, dtype=torch.int32, device=self.device)
+                    "point_coords": torch.zeros(batch_size, 1, 2, device=self.device),
+                    "point_labels": -torch.ones(batch_size, 1, dtype=torch.int32, device=self.device)
                 }
 
                 current_out, _ = self.predictor.model.tracker._run_single_frame_inference(
                     inference_state=tracker_state,
                     output_dict=tracker_state["output_dict"],
                     frame_idx=frame_idx,
-                    batch_size=1,
+                    batch_size=batch_size,
                     is_init_cond_frame=False,
                     point_inputs=dummy_point_inputs,
                     mask_inputs=None,
@@ -463,10 +461,6 @@ class HybridSam3MotionLoop:
                 tracker_state["frames_already_tracked"][frame_idx] = {"reverse": False}
 
                 prev_logits = current_out["pred_masks"].to(self.device).float()
-                if prev_logits.shape[0] > 0:
-                    prev_logits = prev_logits[0:1]
-                else:
-                    prev_logits = torch.zeros((1, 1, h_mask, w_mask), device=self.device)
 
         final_masks = []
 
@@ -476,7 +470,7 @@ class HybridSam3MotionLoop:
             
             logits_gpu = out["pred_masks_high_res"].to(self.device) if "pred_masks_high_res" in out else out["pred_masks"].to(self.device)
             if logits_gpu.shape[0] > 0:
-                logits_gpu = logits_gpu[0:1]
+                logits_gpu = torch.max(logits_gpu, dim=0, keepdim=True).values
             else:
                 logits_gpu = torch.zeros((1, 1, height, width), device=self.device)
             logits_resized = torch.nn.functional.interpolate(
@@ -673,19 +667,14 @@ def process_video_in_batches(
             tensors_rgb.append(t_rgb)
             
         prev_logits = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].to(hybrid_loop.device).float()
-        if prev_logits.shape[0] > 0:
-            prev_logits = prev_logits[0:1]
-        else:
-            h_mask = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].shape[2]
-            w_mask = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].shape[3]
-            prev_logits = torch.zeros((1, 1, h_mask, w_mask), device=hybrid_loop.device)
+        batch_size = len(tracker_state["obj_ids"])
         
         eye_masks = []
         
         out_f0 = tracker_state["output_dict"]["cond_frame_outputs"][0]
         logits_f0 = out_f0["pred_masks_high_res"] if "pred_masks_high_res" in out_f0 else out_f0["pred_masks"]
         if logits_f0.shape[0] > 0:
-            logits_f0 = logits_f0[0:1]
+            logits_f0 = torch.max(logits_f0, dim=0, keepdim=True).values
         else:
             logits_f0 = torch.zeros((1, 1, height, half_w), device=hybrid_loop.device)
         logits_f0_resized = torch.nn.functional.interpolate(
@@ -717,18 +706,18 @@ def process_video_in_batches(
                 flow_downscaled[0] *= (w_mask / half_w)
                 flow_downscaled[1] *= (h_mask / height)
                 
-                warped_logits = hybrid_loop.raft._warp_frame(prev_logits.squeeze(0), flow_downscaled).unsqueeze(0)
+                warped_logits = hybrid_loop.raft._warp_frame(prev_logits, flow_downscaled)
                 
                 dummy_point_inputs = {
-                    "point_coords": torch.zeros(1, 1, 2, device=hybrid_loop.device),
-                    "point_labels": -torch.ones(1, 1, dtype=torch.int32, device=hybrid_loop.device)
+                    "point_coords": torch.zeros(batch_size, 1, 2, device=hybrid_loop.device),
+                    "point_labels": -torch.ones(batch_size, 1, dtype=torch.int32, device=hybrid_loop.device)
                 }
                 
                 current_out, _ = hybrid_loop.predictor.model.tracker._run_single_frame_inference(
                     inference_state=tracker_state,
                     output_dict=tracker_state["output_dict"],
                     frame_idx=frame_idx,
-                    batch_size=1,
+                    batch_size=batch_size,
                     is_init_cond_frame=False,
                     point_inputs=dummy_point_inputs,
                     mask_inputs=None,
@@ -744,14 +733,10 @@ def process_video_in_batches(
                 tracker_state["frames_already_tracked"][frame_idx] = {"reverse": False}
                 
                 prev_logits = current_out["pred_masks"].to(hybrid_loop.device).float()
-                if prev_logits.shape[0] > 0:
-                    prev_logits = prev_logits[0:1]
-                else:
-                    prev_logits = torch.zeros((1, 1, h_mask, w_mask), device=hybrid_loop.device)
                 
                 logits_gpu = current_out["pred_masks_high_res"] if "pred_masks_high_res" in current_out else current_out["pred_masks"]
                 if logits_gpu.shape[0] > 0:
-                    logits_gpu = logits_gpu[0:1]
+                    logits_gpu = torch.max(logits_gpu, dim=0, keepdim=True).values
                 else:
                     logits_gpu = torch.zeros((1, 1, height, half_w), device=hybrid_loop.device)
                 logits_resized = torch.nn.functional.interpolate(
@@ -820,8 +805,8 @@ def process_video_in_batches(
     print("Stereoscopic chunked processing complete!")
 
 process_video_in_batches(
-    video_path="video.mp4",
-    out_path="video_out.mp4",
+    video_path="vid.mp4",
+    out_path="vidout.mp4",
     prompt_text="One girl",
     batch_size=100,
     use_class_process_batch=False
