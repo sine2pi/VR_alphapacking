@@ -827,8 +827,8 @@ def process_video_in_batches(
     print("Stereoscopic chunked processing complete!")
 
 process_video_in_batches(
-    video_path="test.mp4",
-    out_path="test_o2.mp4",
+    video_path="video.mp4",
+    out_path="video_out.mp4",
     prompt_text="One girl",
     batch_size=100,
     matte_size=0.4, # deovr uses 40%
