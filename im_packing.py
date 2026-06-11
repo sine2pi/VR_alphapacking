@@ -445,7 +445,7 @@ class HybridSam3MotionLoop:
                 prev_logits = current_out["pred_masks"].to(self.device).float()
 
         final_masks = []
-        stabilized_soft = []
+
         for i in range(chunk_length):
             storage_key = "cond_frame_outputs" if i == 0 else "non_cond_frame_outputs"
             out = tracker_state["output_dict"][storage_key][i]
@@ -587,7 +587,8 @@ def process_video_in_batches(
     left_bbox=None, 
     right_bbox=None,
     prompt_text=None,
-    batch_size=100
+    batch_size=100,
+    use_class_process_batch=False
 ):
 
     predictor = build_sam3_video_predictor(
@@ -735,11 +736,29 @@ def process_video_in_batches(
         frames_r_bgr = [f[:, half_w:] for f in frames_bgr]
         
         print(f"\n[SBS] Tracking Left Eye Batch (Frames {frame_count} to {frame_count+chunk_length-1})...")
-        masks_l = propagate_eye(frames_l_bgr, left_bbox)
+        if use_class_process_batch:
+            eye_frames_pil_l = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_l_bgr]
+            masks_l = hybrid_loop.process_batch(
+                frames_pil=eye_frames_pil_l,
+                frames_bgr=frames_l_bgr,
+                prompt_text=prompt_text,
+                bbox=left_bbox
+            )
+        else:
+            masks_l = propagate_eye(frames_l_bgr, left_bbox)
         torch.cuda.empty_cache()
         
         print(f"[SBS] Tracking Right Eye Batch (Frames {frame_count} to {frame_count+chunk_length-1})...")
-        masks_r = propagate_eye(frames_r_bgr, right_bbox)
+        if use_class_process_batch:
+            eye_frames_pil_r = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_r_bgr]
+            masks_r = hybrid_loop.process_batch(
+                frames_pil=eye_frames_pil_r,
+                frames_bgr=frames_r_bgr,
+                prompt_text=prompt_text,
+                bbox=right_bbox
+            )
+        else:
+            masks_r = propagate_eye(frames_r_bgr, right_bbox)
         torch.cuda.empty_cache()
         
         for i in range(chunk_length):
@@ -758,5 +777,6 @@ process_video_in_batches(
     video_path="test_sbs.mp4",
     out_path="test_sbs_out.mp4",
     prompt_text="One girl",
-    batch_size=100
+    batch_size=100,
+    use_class_process_batch=False
 )
