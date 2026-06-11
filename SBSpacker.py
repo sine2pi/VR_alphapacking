@@ -1,5 +1,4 @@
 import cv2, torch, subprocess, numpy as np, json, logging
-import torchvision.transforms.functional as TVF
 import torch.nn.functional as F
 from tqdm import tqdm
 from PIL import Image
@@ -10,8 +9,8 @@ try:
 except ImportError:
     HAS_RAFT = False
 
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+# torch.backends.cuda.matmul.allow_tf32 = True
+# torch.backends.cudnn.allow_tf32 = True
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -20,16 +19,16 @@ def metadata(path):
     cmd_key = [
         'ffprobe', '-v', 'error', '-select_streams', 'v:0',
         '-show_entries', 'frame=pict_type',
-        '-of', 'csv=p=0', '-skip_frame', 'nokey', path
-    ]
+        '-of', 'csv=p=0', '-skip_frame', 'nokey', path]
+
     res_key = subprocess.run(cmd_key, capture_output=True, text=True)
     lines = res_key.stdout.strip().split('\n')
     num_keyframes = len(lines)
 
     cmd_stream = [
         'ffprobe', '-v', 'quiet', '-print_format', 'json', 
-        '-show_streams', '-select_streams', 'v:0', path
-    ]
+        '-show_streams', '-select_streams', 'v:0', path]
+
     res_stream = subprocess.run(cmd_stream, capture_output=True, text=True)
     data = json.loads(res_stream.stdout)
     
@@ -70,30 +69,32 @@ def eye_frames(video_path, start_frame, num_frames):
     return frames_l, frames_r
 
 def ffmpeg_pipe(out_path, width, height, fps):
+
     ffmpeg_cmd = [
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
         '-s', f'{width}x{height}', '-pix_fmt', 'bgr24', '-r', str(fps),
-        '-i', '-', '-c:v', 'hevc_nvenc', '-preset', 'fast', '-cq', '20',
+        '-i', '-', '-c:v', 'hevc_nvenc', '-preset', 'fast', '-cq', '16',
+          # '-i', '-', '-c:v', 'dnxhd', '-profile:v', 'dnxhr_lq',
         '-pix_fmt', 'yuv420p', '-colorspace', 'bt709', '-color_primaries', 'bt709',
         '-color_trc', 'bt709', '-color_range', 'tv', out_path
     ]
     return subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 def process_single_eye_video(
-    video_path, out_path, hybrid_loop, total_frames, fps, width, height, bbox
-):
+    video_path, out_path, hybrid_loop, total_frames, fps, width, height, bbox):
 
     res = hybrid_loop.predictor.handle_request(dict(
         type="start_session",
-        resource_path=video_path
-    ))
+        resource_path=video_path))
+
     sid = res["session_id"]
     prompt_req = dict(type="add_prompt", session_id=sid, frame_index=0, obj_id=0)
+
     if bbox is not None:
         prompt_req["bounding_boxes"] = [bbox]
         prompt_req["bounding_box_labels"] = [1]
-    hybrid_loop.predictor.handle_request(prompt_req)
 
+    hybrid_loop.predictor.handle_request(prompt_req)
     session = hybrid_loop.predictor._get_session(sid)
     inference_state = session["state"]
     tracker_state = inference_state["tracker_inference_states"][0]
@@ -113,6 +114,7 @@ def process_single_eye_video(
     batch_size = len(tracker_state["obj_ids"])
 
     with torch.inference_mode():
+
         for frame_idx in tqdm(range(1, total_frames), desc="Processing Single Eye"):
             ret, curr_frame_bgr = cap.read()
             if not ret: break
@@ -128,9 +130,7 @@ def process_single_eye_video(
 
             _, _, h_mask, w_mask = prev_logits.shape
             flow = hybrid_loop.raft._compute_raft_flow(prev_tensor.unsqueeze(0), curr_tensor.unsqueeze(0)).squeeze(0)
-            flow_downscaled = torch.nn.functional.interpolate(
-                flow.unsqueeze(0), size=(h_mask, w_mask), mode="bilinear", align_corners=False
-            ).squeeze(0)
+            flow_downscaled = torch.nn.functional.interpolate(flow.unsqueeze(0), size=(h_mask, w_mask), mode="bilinear", align_corners=False).squeeze(0)
             flow_downscaled[0] *= (w_mask / width)
             flow_downscaled[1] *= (h_mask / height)
 
@@ -156,24 +156,23 @@ def process_single_eye_video(
 
             tracker_state["output_dict"]["non_cond_frame_outputs"][frame_idx] = current_out
             hybrid_loop.predictor.model.tracker._add_output_per_object(
-                tracker_state, frame_idx, current_out, "non_cond_frame_outputs"
-            )
-            tracker_state["frames_already_tracked"][frame_idx] = {"reverse": False}
+                tracker_state, frame_idx, current_out, "non_cond_frame_outputs")
 
+            tracker_state["frames_already_tracked"][frame_idx] = {"reverse": False}
             prev_logits = current_out["pred_masks"].to(hybrid_loop.device).float()
             prev_tensor = curr_tensor
-
             logits_gpu = current_out["pred_masks_high_res"] if "pred_masks_high_res" in current_out else current_out["pred_masks"]
+
             if logits_gpu.shape[0] > 0:
                 logits_gpu = torch.max(logits_gpu, dim=0, keepdim=True).values
             else:
                 logits_gpu = torch.zeros((1, 1, height, width), device=hybrid_loop.device)
+
             logits_resized = torch.nn.functional.interpolate(
                 logits_gpu.to(hybrid_loop.device),
                 size=(height, width),
                 mode="bilinear",
-                align_corners=False
-            ).squeeze(0).squeeze(0)
+                align_corners=False).squeeze(0).squeeze(0)
             
             prob = torch.sigmoid(logits_resized).cpu().numpy()
             mask_bin = ((prob > 0.5).astype(np.uint8) * 255)
@@ -212,8 +211,10 @@ class RaftMotionCompensator:
         orig_H, orig_W = img1.shape[2], img1.shape[3]
         scale_factor = self.flow_scale
         current_H, current_W = orig_H * scale_factor, orig_W * scale_factor
+
         if max(current_H, current_W) > self.max_size:
             scale_factor = scale_factor * (self.max_size / float(max(current_H, current_W)))
+
         if scale_factor != 1.0:
             new_H, new_W = int(orig_H * scale_factor), int(orig_W * scale_factor)
             img1_s = F.interpolate(img1, size=(new_H, new_W), mode=self.interp_mode, antialias=True)
@@ -224,6 +225,7 @@ class RaftMotionCompensator:
         img1_t, img2_t = self.transforms(img1_s, img2_s)
         _, _, H_s, W_s = img1_t.shape
         pad_h, pad_w = (8 - H_s % 8) % 8, (8 - W_s % 8) % 8
+
         if pad_h > 0 or pad_w > 0:
             img1_t = F.pad(img1_t, (0, pad_w, 0, pad_h))
             img2_t = F.pad(img2_t, (0, pad_w, 0, pad_h))
@@ -232,14 +234,18 @@ class RaftMotionCompensator:
             flow = self.model(img1_t, img2_t)[-1].float()
             
         flow = torch.nan_to_num(flow, nan=0.0, posinf=0.0, neginf=0.0)
+
         if pad_h > 0 or pad_w > 0:
             flow = flow[:, :, :H_s, :W_s]
+
         if scale_factor != 1.0:
             flow = F.interpolate(flow, size=(orig_H, orig_W), mode=self.interp_mode)
             flow = flow / scale_factor
+
         return flow
 
     def _warp_frame(self, pt_frame, flow, t=1.0):
+
         if pt_frame.ndim == 3:
             C, H, W = pt_frame.shape
             flow_scaled = flow * t
@@ -247,9 +253,13 @@ class RaftMotionCompensator:
             x_norm = 2.0 * (x + flow_scaled[0]) / max(W - 1, 1) - 1.0
             y_norm = 2.0 * (y + flow_scaled[1]) / max(H - 1, 1) - 1.0
             grid = torch.stack((x_norm, y_norm), dim=-1).unsqueeze(0)
-            return F.grid_sample(
-                pt_frame.unsqueeze(0), grid, mode='bilinear', padding_mode='border', align_corners=False
-            ).squeeze(0)
+            align_corners = True if self.interp_mode != 'nearest' else None
+
+            if align_corners is None:
+                return F.grid_sample(pt_frame.unsqueeze(0), grid, mode=self.interp_mode, padding_mode='border').squeeze(0)
+            else:
+                return F.grid_sample(pt_frame.unsqueeze(0), grid, mode=self.interp_mode, padding_mode='border', align_corners=align_corners).squeeze(0)
+
         elif pt_frame.ndim == 4:
             N, C, H, W = pt_frame.shape
             flow_scaled = flow * t
@@ -258,15 +268,19 @@ class RaftMotionCompensator:
             y_norm = 2.0 * (y + flow_scaled[1]) / max(H - 1, 1) - 1.0
             grid = torch.stack((x_norm, y_norm), dim=-1).unsqueeze(0)
             grid = grid.expand(N, -1, -1, -1)
-            return F.grid_sample(
-                pt_frame, grid, mode='bilinear', padding_mode='border', align_corners=False
-            )
+            align_corners = True if self.interp_mode != 'nearest' else None
+
+            if align_corners is None:
+                return F.grid_sample(pt_frame, grid, mode=self.interp_mode, padding_mode='border')
+            else:
+                return F.grid_sample(pt_frame, grid, mode=self.interp_mode, padding_mode='border', align_corners=align_corners)
         else:
             raise ValueError(f"Unexpected pt_frame dimensions: {pt_frame.ndim}")
 
     def stabilize_alpha_sequence(self, rgb_frames, alpha_masks, blend_weights=(0.2, 0.6, 0.2)):
         self._load_model()
         is_numpy = isinstance(rgb_frames, np.ndarray)
+
         if is_numpy:
             t_rgb = torch.from_numpy(rgb_frames).permute(0, 3, 1, 2).float().div(255.0).to(self.device)
             if alpha_masks.ndim == 3:
@@ -279,7 +293,6 @@ class RaftMotionCompensator:
 
         num_frames = t_rgb.shape[0]
         if num_frames < 3: return alpha_masks
-
         stabilized_alphas = torch.zeros_like(t_alpha)
         stabilized_alphas[0] = t_alpha[0]
         stabilized_alphas[-1] = t_alpha[-1]
@@ -303,25 +316,31 @@ class RaftMotionCompensator:
         return stabilized_alphas
 
     def interpolate_video(self, input_video, output_video, src_fps, dst_fps, width, height, encoder_opts, read_cmd=None):
+
         self._load_model()
         cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', input_video]
         duration = float(subprocess.check_output(cmd).decode().strip())
         num_src_frames = int(duration * src_fps)
         num_dst_frames = int(duration * dst_fps)
         step = src_fps / dst_fps
+
         if read_cmd is None:
             read_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", input_video, "-f", "image2pipe", "-pix_fmt", "rgb24", "-vcodec", "rawvideo", "-"]
+
         write_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-vcodec", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", str(dst_fps), "-i", "-"] + encoder_opts + [output_video]
         reader = subprocess.Popen(read_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=width*height*3*2)
         writer = subprocess.Popen(write_cmd, stdin=subprocess.PIPE, bufsize=width*height*3*2)
+
         def read_frame():
             raw = reader.stdout.read(width * height * 3)
             if not raw: return None
             frame = np.frombuffer(raw, dtype=np.uint8).copy().reshape((height, width, 3))
             return torch.from_numpy(frame).permute(2, 0, 1).float().div(255.0).to(self.device)
+
         frame_a = read_frame()
         if frame_a is None:
             raise RuntimeError("Failed to read any frames from FFmpeg!")
+
         frame_b = read_frame()
         current_idx, out_idx = 0, 0
         with torch.no_grad():
@@ -357,25 +376,22 @@ class RaftMotionCompensator:
                     writer.stdin.write((out_frame.cpu().permute(1,2,0).numpy() * 255).astype(np.uint8).tobytes())
                     out_idx += 1
                     pbar.update(1)
+
         reader.stdout.close()
         writer.stdin.close()
         writer.wait()
         reader.wait()
 
 class HybridSam3MotionLoop:
-
     def __init__(self, video_predictor=None, raft_compensator=None, target_res=(256, 256)):
-
         self.predictor = build_sam3_video_predictor(
         offload_video_to_cpu=True,
         async_loading_frames=True) or video_predictor
-
         self.raft = raft_compensator or RaftMotionCompensator()
         self.device = self.raft.device
         self.target_res = target_res
 
     def process_batch(self, frames_pil, frames_bgr, prompt_text=None, bbox=None):
-
         self.raft._load_model()
         height, width = frames_bgr[0].shape[:2]
         chunk_length = len(frames_pil)
@@ -384,25 +400,30 @@ class HybridSam3MotionLoop:
             type="start_session",
             resource_path=frames_pil
         ))
-        sid_inline = res_inline["session_id"]
 
+        sid_inline = res_inline["session_id"]
         prompt_req_inline = dict(type="add_prompt", session_id=sid_inline, frame_index=0, obj_id=0)
+
         if prompt_text is not None:
             prompt_req_inline["text"] = prompt_text
+
         if bbox is not None:
             prompt_req_inline["bounding_boxes"] = [bbox]
             prompt_req_inline["bounding_box_labels"] = [1]
 
         self.predictor.handle_request(prompt_req_inline)
-
         session_inline = self.predictor._get_session(sid_inline)
         inference_state = session_inline["state"]
         tracker_states = inference_state["tracker_inference_states"]
-        if len(tracker_states) == 0:
-            raise RuntimeError("No tracker state found after adding prompt to inline session!")
-        tracker_state = tracker_states[0]
 
+        if len(tracker_states) == 0:
+            print(f"[WARNING] Prompt '{prompt_text}' found no objects in this chunk. Generating empty masks.")
+            self.predictor.handle_request(dict(type="close_session", session_id=sid_inline))
+            return [np.zeros((height, width), dtype=np.uint8) for _ in range(chunk_length)]
+
+        tracker_state = tracker_states[0]
         tensors_rgb = []
+
         for f_bgr in frames_bgr:
             f_rgb = cv2.cvtColor(f_bgr, cv2.COLOR_BGR2RGB)
             t_rgb = torch.from_numpy(f_rgb).permute(2, 0, 1).float().div(255.0).to(self.device)
@@ -422,9 +443,7 @@ class HybridSam3MotionLoop:
 
                 self.predictor.model._prepare_backbone_feats(
                     inference_state=inference_state,
-                    frame_idx=frame_idx,
-                    reverse=False
-                )
+                    frame_idx=frame_idx, reverse=False)
 
                 _, _, h_mask, w_mask = prev_logits.shape
                 flow = self.raft._compute_raft_flow(prev_tensor.unsqueeze(0), curr_tensor.unsqueeze(0)).squeeze(0)
@@ -458,8 +477,8 @@ class HybridSam3MotionLoop:
                 self.predictor.model.tracker._add_output_per_object(
                     tracker_state, frame_idx, current_out, "non_cond_frame_outputs"
                 )
-                tracker_state["frames_already_tracked"][frame_idx] = {"reverse": False}
 
+                tracker_state["frames_already_tracked"][frame_idx] = {"reverse": False}
                 prev_logits = current_out["pred_masks"].to(self.device).float()
 
         final_masks = []
@@ -467,30 +486,27 @@ class HybridSam3MotionLoop:
         for i in range(chunk_length):
             storage_key = "cond_frame_outputs" if i == 0 else "non_cond_frame_outputs"
             out = tracker_state["output_dict"][storage_key][i]
-            
             logits_gpu = out["pred_masks_high_res"].to(self.device) if "pred_masks_high_res" in out else out["pred_masks"].to(self.device)
+
             if logits_gpu.shape[0] > 0:
                 logits_gpu = torch.max(logits_gpu, dim=0, keepdim=True).values
             else:
                 logits_gpu = torch.zeros((1, 1, height, width), device=self.device)
+
             logits_resized = torch.nn.functional.interpolate(
                 logits_gpu,
                 size=(height, width),
                 mode="bilinear",
-                align_corners=False
-            ).squeeze(0).squeeze(0)
+                align_corners=False).squeeze(0).squeeze(0)
             
             prob = torch.sigmoid(logits_resized).cpu().numpy()
             final_masks.append((prob > 0.5).astype(np.uint8) * 255)
 
         self.predictor.handle_request(dict(type="close_session", session_id=sid_inline))
-
         print(f"[DEBUG] Final masks sums for first 5 frames: {[np.sum(final_masks[i]) for i in range(min(5, chunk_length))]}")
-
         return final_masks
 
 class AlphaCornerPacker:
-
     def __init__(self, scale_factor=0.40, padding=0):
         self.scale = scale_factor
         self.padding = padding
@@ -502,14 +518,10 @@ class AlphaCornerPacker:
             return self.vignette_cache
 
         vignette = np.zeros((h, w), dtype=np.float32)
-        
         center = (w // 2, h // 2)
         radius = min(w, h) // 2 - 2 
-
         cv2.circle(vignette, center, radius, 1.0, -1, cv2.LINE_AA)
-        
         self.vignette_cache = cv2.GaussianBlur(vignette, (15, 15), 0)
-        
         return self.vignette_cache
 
     def pack_frame(self, sbs_rgb, mask_l, mask_r):
@@ -528,12 +540,9 @@ class AlphaCornerPacker:
         lh, lw = mask_l_small.shape
         mask_r_small = cv2.resize(mask_r, (target_w, target_h), interpolation=cv2.INTER_AREA)
         rh, rw = mask_r_small.shape
-        
         vignette = self._get_circular_vignette(target_w, target_h)
-        
         mask_l_vignette = (mask_l_small * vignette).astype(np.uint8)
         mask_r_vignette = (mask_r_small * vignette).astype(np.uint8)
-
         packed_frame = sbs_rgb.copy()
 
         h_half = target_h // 2
@@ -549,7 +558,6 @@ class AlphaCornerPacker:
         def blend_red_mask(roi, mask_1ch):
             alpha = mask_1ch.astype(np.float32) / 255.0
             alpha = np.expand_dims(alpha, axis=2)
-            
             red_color = np.array([0, 0, 255], dtype=np.float32)
             blended = (1.0 - alpha) * roi.astype(np.float32) + alpha * red_color
             return blended.astype(np.uint8)
@@ -616,22 +624,18 @@ def process_video_in_batches(
 
     predictor = build_sam3_video_predictor(
         offload_video_to_cpu=True,
-        async_loading_frames=True,
-    )
+        async_loading_frames=True)
+
     hybrid_loop = HybridSam3MotionLoop(
         video_predictor=predictor,
-        raft_compensator=RaftMotionCompensator(device="cuda"),
-    )
+        raft_compensator=RaftMotionCompensator(device="cuda"))
 
     total_frames, num_keyframes, width, height, duration, fps = metadata(video_path)
-
     cap = cv2.VideoCapture(video_path)
     writer = ffmpeg_pipe(out_path, width, height, fps)
     half_w = width // 2
-    
     packer = AlphaCornerPacker(scale_factor=matte_size)
     hybrid_loop.raft._load_model()
-
     frame_count = 0
     pbar = tqdm(total=total_frames, desc="Processing SBS Batches")
 
@@ -656,7 +660,14 @@ def process_video_in_batches(
         
         session = hybrid_loop.predictor._get_session(sid)
         inference_state = session["state"]
-        tracker_state = inference_state["tracker_inference_states"][0]
+        
+        tracker_states = inference_state["tracker_inference_states"]
+        if len(tracker_states) == 0:
+            print(f"[WARNING] Prompt '{prompt_text}' found no objects in this chunk. Generating empty masks.")
+            hybrid_loop.predictor.handle_request(dict(type="close_session", session_id=sid))
+            return [np.zeros((h, w), dtype=np.uint8) for _ in range(chunk_len)]
+            
+        tracker_state = tracker_states[0]
         
         hybrid_loop.predictor.model.tracker.propagate_in_video_preflight(
             tracker_state, run_mem_encoder=True
@@ -675,18 +686,16 @@ def process_video_in_batches(
         
         out_f0 = tracker_state["output_dict"]["cond_frame_outputs"][0]
         logits_f0 = out_f0["pred_masks_high_res"] if "pred_masks_high_res" in out_f0 else out_f0["pred_masks"]
+
         if logits_f0.shape[0] > 0:
             logits_f0 = torch.max(logits_f0, dim=0, keepdim=True).values
         else:
             logits_f0 = torch.zeros((1, 1, h, w), device=hybrid_loop.device)
-        logits_f0_resized = torch.nn.functional.interpolate(
-            logits_f0.to(hybrid_loop.device),
-            size=(h, w),
-            mode="bilinear",
-            align_corners=False
-        ).squeeze(0).squeeze(0)
 
-        prob_f0 = torch.sigmoid(logits_f0_resized).cpu().numpy()
+        f0_resized = torch.nn.functional.interpolate(
+            logits_f0.to(hybrid_loop.device), size=(h, w), mode="bicubic", align_corners=False).squeeze(0).squeeze(0)
+
+        prob_f0 = torch.sigmoid(f0_resized).cpu().numpy()
         eye_masks.append((prob_f0 > 0.5).astype(np.uint8) * 255)
         
         with torch.inference_mode():
@@ -703,8 +712,7 @@ def process_video_in_batches(
                 _, _, h_mask, w_mask = prev_logits.shape
                 flow = hybrid_loop.raft._compute_raft_flow(prev_tensor.unsqueeze(0), curr_tensor.unsqueeze(0)).squeeze(0)
                 flow_downscaled = torch.nn.functional.interpolate(
-                    flow.unsqueeze(0), size=(h_mask, w_mask), mode="bilinear", align_corners=False
-                ).squeeze(0)
+                    flow.unsqueeze(0), size=(h_mask, w_mask), mode="bicubic", align_corners=False).squeeze(0)
                 flow_downscaled[0] *= (w_mask / w)
                 flow_downscaled[1] *= (h_mask / h)
                 
@@ -801,7 +809,7 @@ def process_video_in_batches(
             masks_l = propagate_eye(frames_l_bgr_small, left_bbox_small)
         torch.cuda.empty_cache()
         
-        print(f"[SBS] Tracking Right Eye Batch (Frames {frame_count} to {frame_count+chunk_length-1}) at {int(matte_size*100)}% scale...")
+        print(f"[SBS] Tracking Right Eye Batch (Frames {frame_count} to {frame_count+chunk_length-1}) creating mattes at {int(matte_size*100)}% scale...")
         if use_class_process_batch:
             eye_frames_pil_r = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_r_bgr_small]
             masks_r = hybrid_loop.process_batch(
@@ -828,9 +836,9 @@ def process_video_in_batches(
 
 process_video_in_batches(
     video_path="video.mp4",
-    out_path="video_out.mp4",
+    out_path="out.mp4",
     prompt_text="One girl",
-    batch_size=100,
-    matte_size=0.4, # deovr uses 40%
-    use_class_process_batch=False
+    batch_size=32,
+    matte_size=0.4,
+    use_class_process_batch=True
 )
