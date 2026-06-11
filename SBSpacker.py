@@ -610,6 +610,7 @@ def process_video_in_batches(
     right_bbox=None,
     prompt_text=None,
     batch_size=100,
+    matte_size=0.4,
     use_class_process_batch=False
 ):
 
@@ -628,7 +629,7 @@ def process_video_in_batches(
     writer = ffmpeg_pipe(out_path, width, height, fps)
     half_w = width // 2
     
-    packer = AlphaCornerPacker(scale_factor=0.40)
+    packer = AlphaCornerPacker(scale_factor=matte_size)
     hybrid_loop.raft._load_model()
 
     frame_count = 0
@@ -636,6 +637,7 @@ def process_video_in_batches(
 
     def propagate_eye(eye_frames_bgr, bbox):
         chunk_len = len(eye_frames_bgr)
+        h, w = eye_frames_bgr[0].shape[:2]
         eye_frames_pil = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in eye_frames_bgr]
         
         res = hybrid_loop.predictor.handle_request(dict(
@@ -676,10 +678,10 @@ def process_video_in_batches(
         if logits_f0.shape[0] > 0:
             logits_f0 = torch.max(logits_f0, dim=0, keepdim=True).values
         else:
-            logits_f0 = torch.zeros((1, 1, height, half_w), device=hybrid_loop.device)
+            logits_f0 = torch.zeros((1, 1, h, w), device=hybrid_loop.device)
         logits_f0_resized = torch.nn.functional.interpolate(
             logits_f0.to(hybrid_loop.device),
-            size=(height, half_w),
+            size=(h, w),
             mode="bilinear",
             align_corners=False
         ).squeeze(0).squeeze(0)
@@ -703,8 +705,8 @@ def process_video_in_batches(
                 flow_downscaled = torch.nn.functional.interpolate(
                     flow.unsqueeze(0), size=(h_mask, w_mask), mode="bilinear", align_corners=False
                 ).squeeze(0)
-                flow_downscaled[0] *= (w_mask / half_w)
-                flow_downscaled[1] *= (h_mask / height)
+                flow_downscaled[0] *= (w_mask / w)
+                flow_downscaled[1] *= (h_mask / h)
                 
                 warped_logits = hybrid_loop.raft._warp_frame(prev_logits, flow_downscaled)
                 
@@ -738,10 +740,10 @@ def process_video_in_batches(
                 if logits_gpu.shape[0] > 0:
                     logits_gpu = torch.max(logits_gpu, dim=0, keepdim=True).values
                 else:
-                    logits_gpu = torch.zeros((1, 1, height, half_w), device=hybrid_loop.device)
+                    logits_gpu = torch.zeros((1, 1, h, w), device=hybrid_loop.device)
                 logits_resized = torch.nn.functional.interpolate(
                     logits_gpu.to(hybrid_loop.device),
-                    size=(height, half_w),
+                    size=(h, w),
                     mode="bilinear",
                     align_corners=False
                 ).squeeze(0).squeeze(0)
@@ -765,31 +767,51 @@ def process_video_in_batches(
         
         frames_l_bgr = [f[:, :half_w] for f in frames_bgr]
         frames_r_bgr = [f[:, half_w:] for f in frames_bgr]
+
+        target_w = int(half_w * matte_size)
+        target_h = int(height * matte_size)
         
-        print(f"\n[SBS] Tracking Left Eye Batch (Frames {frame_count} to {frame_count+chunk_length-1})...")
+        frames_l_bgr_small = [cv2.resize(f, (target_w, target_h), interpolation=cv2.INTER_AREA) for f in frames_l_bgr]
+        frames_r_bgr_small = [cv2.resize(f, (target_w, target_h), interpolation=cv2.INTER_AREA) for f in frames_r_bgr]
+        
+        left_bbox_small = [
+            left_bbox[0] * matte_size,
+            left_bbox[1] * matte_size,
+            left_bbox[2] * matte_size,
+            left_bbox[3] * matte_size
+        ] if left_bbox is not None else None
+        
+        right_bbox_small = [
+            right_bbox[0] * matte_size,
+            right_bbox[1] * matte_size,
+            right_bbox[2] * matte_size,
+            right_bbox[3] * matte_size
+        ] if right_bbox is not None else None
+        
+        print(f"\n[SBS] Tracking Left Eye Batch (Frames {frame_count} to {frame_count+chunk_length-1}) at {int(matte_size*100)}% scale...")
         if use_class_process_batch:
-            eye_frames_pil_l = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_l_bgr]
+            eye_frames_pil_l = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_l_bgr_small]
             masks_l = hybrid_loop.process_batch(
                 frames_pil=eye_frames_pil_l,
-                frames_bgr=frames_l_bgr,
+                frames_bgr=frames_l_bgr_small,
                 prompt_text=prompt_text,
-                bbox=left_bbox
+                bbox=left_bbox_small
             )
         else:
-            masks_l = propagate_eye(frames_l_bgr, left_bbox)
+            masks_l = propagate_eye(frames_l_bgr_small, left_bbox_small)
         torch.cuda.empty_cache()
         
-        print(f"[SBS] Tracking Right Eye Batch (Frames {frame_count} to {frame_count+chunk_length-1})...")
+        print(f"[SBS] Tracking Right Eye Batch (Frames {frame_count} to {frame_count+chunk_length-1}) at {int(matte_size*100)}% scale...")
         if use_class_process_batch:
-            eye_frames_pil_r = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_r_bgr]
+            eye_frames_pil_r = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_r_bgr_small]
             masks_r = hybrid_loop.process_batch(
                 frames_pil=eye_frames_pil_r,
-                frames_bgr=frames_r_bgr,
+                frames_bgr=frames_r_bgr_small,
                 prompt_text=prompt_text,
-                bbox=right_bbox
+                bbox=right_bbox_small
             )
         else:
-            masks_r = propagate_eye(frames_r_bgr, right_bbox)
+            masks_r = propagate_eye(frames_r_bgr_small, right_bbox_small)
         torch.cuda.empty_cache()
         
         for i in range(chunk_length):
@@ -805,9 +827,10 @@ def process_video_in_batches(
     print("Stereoscopic chunked processing complete!")
 
 process_video_in_batches(
-    video_path="vid.mp4",
-    out_path="vidout.mp4",
+    video_path="test.mp4",
+    out_path="test_o2.mp4",
     prompt_text="One girl",
     batch_size=100,
+    matte_size=0.4, # deovr uses 40%
     use_class_process_batch=False
 )
