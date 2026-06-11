@@ -447,9 +447,7 @@ class HybridSam3MotionLoop:
 
                 _, _, h_mask, w_mask = prev_logits.shape
                 flow = self.raft._compute_raft_flow(prev_tensor.unsqueeze(0), curr_tensor.unsqueeze(0)).squeeze(0)
-                flow_downscaled = torch.nn.functional.interpolate(
-                    flow.unsqueeze(0), size=(h_mask, w_mask), mode="bilinear", align_corners=False
-                ).squeeze(0)
+                flow_downscaled = torch.nn.functional.interpolate(flow.unsqueeze(0), size=(h_mask, w_mask), mode="bilinear", align_corners=False).squeeze(0)
                 flow_downscaled[0] *= (w_mask / width)
                 flow_downscaled[1] *= (h_mask / height)
                 
@@ -474,9 +472,7 @@ class HybridSam3MotionLoop:
                 )
 
                 tracker_state["output_dict"]["non_cond_frame_outputs"][frame_idx] = current_out
-                self.predictor.model.tracker._add_output_per_object(
-                    tracker_state, frame_idx, current_out, "non_cond_frame_outputs"
-                )
+                self.predictor.model.tracker._add_output_per_object(tracker_state, frame_idx, current_out, "non_cond_frame_outputs")
 
                 tracker_state["frames_already_tracked"][frame_idx] = {"reverse": False}
                 prev_logits = current_out["pred_masks"].to(self.device).float()
@@ -619,7 +615,7 @@ def process_video_in_batches(
     prompt_text=None,
     batch_size=100,
     matte_size=0.4,
-    use_class_process_batch=False
+    use_warped_logits=False
 ):
 
     predictor = build_sam3_video_predictor(
@@ -797,7 +793,7 @@ def process_video_in_batches(
         ] if right_bbox is not None else None
         
         print(f"\n[SBS] Tracking Left Eye Batch (Frames {frame_count} to {frame_count+chunk_length-1}) at {int(matte_size*100)}% scale...")
-        if use_class_process_batch:
+        if use_warped_logits:
             eye_frames_pil_l = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_l_bgr_small]
             masks_l = hybrid_loop.process_batch(
                 frames_pil=eye_frames_pil_l,
@@ -810,7 +806,7 @@ def process_video_in_batches(
         torch.cuda.empty_cache()
         
         print(f"[SBS] Tracking Right Eye Batch (Frames {frame_count} to {frame_count+chunk_length-1}) creating mattes at {int(matte_size*100)}% scale...")
-        if use_class_process_batch:
+        if use_warped_logits:
             eye_frames_pil_r = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_r_bgr_small]
             masks_r = hybrid_loop.process_batch(
                 frames_pil=eye_frames_pil_r,
@@ -840,5 +836,5 @@ process_video_in_batches(
     prompt_text="One girl",
     batch_size=32,
     matte_size=0.4,
-    use_class_process_batch=True
-)
+    use_warped_logits=True
+    )
