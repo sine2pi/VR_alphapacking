@@ -1,3 +1,5 @@
+# slower than the np riddled one but at least it looks nicer. pytorch is great at math bad at plumbing.
+
 import torch, subprocess, numpy as np, json, logging
 import torchvision.transforms.functional as TVF
 import torch.nn.functional as F
