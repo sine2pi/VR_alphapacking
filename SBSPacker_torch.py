@@ -1,7 +1,7 @@
-import cv2, torch, subprocess, numpy as np, json, logging
+import torch, subprocess, numpy as np, json, logging
+import torchvision.transforms.functional as TVF
 import torch.nn.functional as F
 from tqdm import tqdm
-from PIL import Image
 from model_builder import build_sam3_video_predictor
 try:
     from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
@@ -56,26 +56,36 @@ def metadata(path):
 
 def eye_frames(video_path, start_frame, num_frames):
 
-    cap_chunk = cv2.VideoCapture(video_path)
-    cap_chunk.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    nb_frames, num_keyframes, width, height, duration, fps = metadata(video_path)
+    if width is None: return [], []
+    start_time = start_frame / fps if fps > 0 else 0
+
+    cmd = [
+        'ffmpeg', '-ss', str(start_time), '-i', video_path,
+        '-vframes', str(num_frames), '-f', 'image2pipe', '-pix_fmt', 'rgb24',
+        '-vcodec', 'rawvideo', '-'
+    ]
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     frames_l, frames_r = [], []
+    frame_size = width * height * 3
+    mid = width // 2
 
     for _ in range(num_frames):
-        ret, frame = cap_chunk.read()
-        if not ret: break
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mid = frame.shape[1] // 2
-        frames_l.append(Image.fromarray(frame[:, :mid]))
-        frames_r.append(Image.fromarray(frame[:, mid:]))
+        raw = process.stdout.read(frame_size)
+        if not raw or len(raw) < frame_size: break
+        tensor = torch.frombuffer(raw, dtype=torch.uint8).reshape((height, width, 3))
+        frames_l.append(TVF.to_pil_image(tensor[:, :mid, :].permute(2, 0, 1)))
+        frames_r.append(TVF.to_pil_image(tensor[:, mid:, :].permute(2, 0, 1)))
 
-    cap_chunk.release()
+    process.stdout.close()
+    process.wait()
     return frames_l, frames_r
 
 def ffmpeg_pipe(out_path, width, height, fps):
 
     ffmpeg_cmd = [
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
-        '-s', f'{width}x{height}', '-pix_fmt', 'bgr24', '-r', str(fps),
+        '-s', f'{width}x{height}', '-pix_fmt', 'rgb24', '-r', str(fps),
         '-i', '-', '-c:v', 'hevc_nvenc', '-preset', 'fast', '-cq', '20',
         '-pix_fmt', 'yuv420p', '-colorspace', 'bt709', '-color_primaries', 'bt709',
         '-color_trc', 'bt709', '-color_range', 'tv', out_path
@@ -103,12 +113,23 @@ def process_single_eye_video(video_path, out_path, hybrid_loop, total_frames, fp
         tracker_state, run_mem_encoder=True
     )
 
-    cap = cv2.VideoCapture(video_path)
+    read_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", 
+        "-i", video_path, "-f", "image2pipe", "-pix_fmt", "rgb24", 
+        "-vcodec", "rawvideo", "-"
+    ]
+    reader = subprocess.Popen(read_cmd, stdout=subprocess.PIPE, bufsize=width*height*3*2)
     writer = ffmpeg_pipe(out_path, width, height, fps)
 
-    ret, prev_frame_bgr = cap.read()
-    prev_frame_rgb = cv2.cvtColor(prev_frame_bgr, cv2.COLOR_BGR2RGB)
-    prev_tensor = torch.from_numpy(prev_frame_rgb).permute(2, 0, 1).float().div(255.0).to(hybrid_loop.device)
+    frame_bytes = width * height * 3
+    raw = reader.stdout.read(frame_bytes)
+    if not raw or len(raw) < frame_bytes:
+        reader.stdout.close()
+        writer.stdin.close()
+        return
+
+    prev_frame_rgb = torch.frombuffer(raw, dtype=torch.uint8).reshape((height, width, 3))
+    prev_tensor = prev_frame_rgb.permute(2, 0, 1).float().div(255.0).to(hybrid_loop.device)
 
     prev_logits = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].to(hybrid_loop.device).float()
     batch_size = len(tracker_state["obj_ids"])
@@ -116,11 +137,11 @@ def process_single_eye_video(video_path, out_path, hybrid_loop, total_frames, fp
     with torch.inference_mode():
 
         for frame_idx in tqdm(range(1, total_frames), desc="Processing Single Eye"):
-            ret, curr_frame_bgr = cap.read()
-            if not ret: break
+            raw = reader.stdout.read(frame_bytes)
+            if not raw or len(raw) < frame_bytes: break
 
-            curr_frame_rgb = cv2.cvtColor(curr_frame_bgr, cv2.COLOR_BGR2RGB)
-            curr_tensor = torch.from_numpy(curr_frame_rgb).permute(2, 0, 1).float().div(255.0).to(hybrid_loop.device)
+            curr_frame_rgb = torch.frombuffer(raw, dtype=torch.uint8).reshape((height, width, 3))
+            curr_tensor = curr_frame_rgb.permute(2, 0, 1).float().div(255.0).to(hybrid_loop.device)
 
             hybrid_loop.predictor.model._prepare_backbone_feats(
                 inference_state=inference_state,
@@ -175,13 +196,14 @@ def process_single_eye_video(video_path, out_path, hybrid_loop, total_frames, fp
             overlay = curr_tensor * 0.7
             overlay[0] += mask_bin * 0.3
 
-            overlay_bgr = overlay[[2, 1, 0], :, :].permute(1, 2, 0).mul(255).clamp(0, 255).to(torch.uint8).cpu().numpy()
-            writer.stdin.write(overlay_bgr.tobytes())
+            overlay_rgb = overlay.permute(1, 2, 0).mul(255).clamp(0, 255).to(torch.uint8).cpu().numpy()
+            writer.stdin.write(overlay_rgb.tobytes())
 
             if frame_idx % 10 == 0: 
                 torch.cuda.empty_cache()
 
-    cap.release()
+    reader.stdout.close()
+    reader.wait()
     writer.stdin.close()
     writer.wait()
     hybrid_loop.predictor.handle_request(dict(type="close_session", session_id=sid))
@@ -377,12 +399,14 @@ class HybridSam3MotionLoop:
         self.device = self.raft.device
         self.target_res = target_res
 
-    def process_batch(self, frames_pil, frames_bgr, prompt_text=None, bbox=None):
+    def process_batch(self, frames_tensor_rgb, prompt_text=None, bbox=None):
 
-        tensors_rgb = []
+        B, C, height, width = frames_tensor_rgb.shape
         self.raft._load_model()
-        height, width = frames_bgr[0].shape[:2]
-        chunk_length = len(frames_pil)
+        
+        frames_cpu = (frames_tensor_rgb * 255.0).clamp(0, 255).to(torch.uint8).cpu()
+        frames_pil = [TVF.to_pil_image(frames_cpu[i]) for i in range(B)]
+
         res_inline = self.predictor.handle_request(dict(type="start_session", resource_path=frames_pil))
         sid_inline = res_inline["session_id"]
         prompt_req_inline = dict(type="add_prompt", session_id=sid_inline, frame_index=0, obj_id=0)
@@ -403,43 +427,38 @@ class HybridSam3MotionLoop:
         
         tracker_state = tracker_states[0]
         
-        for f_bgr in frames_bgr:
-            f_rgb = cv2.cvtColor(f_bgr, cv2.COLOR_BGR2RGB)
-            t_rgb = torch.from_numpy(f_rgb).permute(2, 0, 1).float().div(255.0).to(self.device)
-            tensors_rgb.append(t_rgb)
-
         prev_logits = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].to(self.device).float()
-        batch_size = len(tracker_state["obj_ids"])
+        batch_size_obj = len(tracker_state["obj_ids"])
 
         self.predictor.model.tracker.propagate_in_video_preflight(
             tracker_state, run_mem_encoder=True)
 
-        with torch.inference_mode():
-            for frame_idx in range(1, chunk_length):
-                prev_tensor = tensors_rgb[frame_idx - 1]
-                curr_tensor = tensors_rgb[frame_idx]
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            for frame_idx in range(1, B):
+                prev_tensor = frames_tensor_rgb[frame_idx - 1]
+                curr_tensor = frames_tensor_rgb[frame_idx]
 
                 self.predictor.model._prepare_backbone_feats(
                     inference_state=inference_state, frame_idx=frame_idx, reverse=False)
 
                 _, _, h_mask, w_mask = prev_logits.shape
                 flow = self.raft._compute_raft_flow(prev_tensor.unsqueeze(0), curr_tensor.unsqueeze(0)).squeeze(0)
-                flow_downscaled = torch.nn.functional.interpolate(flow.unsqueeze(0), size=(h_mask, w_mask), mode="bilinear", align_corners=False).squeeze(0)
+                flow_downscaled = torch.nn.functional.interpolate(flow.unsqueeze(0), size=(h_mask, w_mask), mode="bicubic", align_corners=False).squeeze(0)
                 flow_downscaled[0] *= (w_mask / width)
                 flow_downscaled[1] *= (h_mask / height)
                 
-                warped_logits = self.raft._warp_frame(prev_logits, flow_downscaled)
+                warped_logits = self.raft._warp_frame(prev_logits.bfloat16(), flow_downscaled).float()
 
                 dummy_point_inputs = {
-                    "point_coords": torch.zeros(batch_size, 1, 2, device=self.device),
-                    "point_labels": -torch.ones(batch_size, 1, dtype=torch.int32, device=self.device)
+                    "point_coords": torch.zeros(batch_size_obj, 1, 2, device=self.device),
+                    "point_labels": -torch.ones(batch_size_obj, 1, dtype=torch.int32, device=self.device)
                 }
 
                 current_out, _ = self.predictor.model.tracker._run_single_frame_inference(
                     inference_state=tracker_state,
                     output_dict=tracker_state["output_dict"],
                     frame_idx=frame_idx,
-                    batch_size=batch_size,
+                    batch_size=batch_size_obj,
                     is_init_cond_frame=False,
                     point_inputs=dummy_point_inputs,
                     mask_inputs=None,
@@ -456,7 +475,7 @@ class HybridSam3MotionLoop:
 
         final_masks = []
 
-        for i in range(chunk_length):
+        for i in range(B):
 
             storage_key = "cond_frame_outputs" if i == 0 else "non_cond_frame_outputs"
             out = tracker_state["output_dict"][storage_key][i]
@@ -466,15 +485,16 @@ class HybridSam3MotionLoop:
                 logits_gpu = torch.max(logits_gpu, dim=0, keepdim=True).values
             else:
                 logits_gpu = torch.zeros((1, 1, height, width), device=self.device)
-            logits_resized = torch.nn.functional.interpolate(logits_gpu, size=(height, width),
+            logits_resized = torch.nn.functional.interpolate(logits_gpu.float(), size=(height, width),
                 mode="bilinear", align_corners=False).squeeze(0).squeeze(0)
             
             prob = torch.sigmoid(logits_resized)
-            final_masks.append((prob > 0.5).float())
+            final_masks.append((prob > 0.5).to(torch.uint8))
 
         self.predictor.handle_request(dict(type="close_session", session_id=sid_inline))
 
-        print(f"[DEBUG] Final masks sums for first 5 frames: {[torch.sum(final_masks[i]).item() for i in range(min(5, chunk_length))]}")
+        print(f"[DEBUG] Final masks sums for first 5 frames: {[torch.sum(final_masks[i]).item() for i in range(min(5, B))]}")
+        torch.cuda.empty_cache()
         return final_masks
 
 class AlphaCornerPacker:
@@ -501,8 +521,8 @@ class AlphaCornerPacker:
         self.vignette_cache = vignette
         return self.vignette_cache
 
-    def pack_batch(self, sbs_bgr_tensor, masks_l_tensor, masks_r_tensor):
-        B, H, SBS_W, C = sbs_bgr_tensor.shape
+    def pack_batch(self, sbs_rgb_tensor, masks_l_tensor, masks_r_tensor):
+        B, H, SBS_W, C = sbs_rgb_tensor.shape
         W = SBS_W // 2
 
         target_w = int(W * self.scale)
@@ -521,7 +541,7 @@ class AlphaCornerPacker:
         mask_l_vignette = masks_l_tensor * vignette
         mask_r_vignette = masks_r_tensor * vignette
 
-        packed_batch = sbs_bgr_tensor.clone()
+        packed_batch = sbs_rgb_tensor.clone()
 
         h_half = target_h // 2
         top_half_mask = mask_l_vignette[:, :h_half, :]
@@ -535,7 +555,7 @@ class AlphaCornerPacker:
 
         def blend_red_mask_torch(roi, mask_1ch):
             alpha = mask_1ch.unsqueeze(-1)
-            red_color = torch.tensor([0.0, 0.0, 255.0], dtype=torch.float32, device=roi.device)
+            red_color = torch.tensor([255.0, 0.0, 0.0], dtype=torch.float32, device=roi.device)
             return ((1.0 - alpha) * roi.float() + alpha * red_color).to(torch.uint8)
 
         y1_top = self.padding
@@ -590,18 +610,18 @@ class AlphaCornerPacker:
     def pack_frame(self, sbs_rgb, mask_l, mask_r):
         is_numpy = isinstance(sbs_rgb, np.ndarray)
         if is_numpy:
-            sbs_bgr_t = torch.from_numpy(sbs_rgb).to(self.device).unsqueeze(0)
+            sbs_rgb_t = torch.from_numpy(sbs_rgb).to(self.device).unsqueeze(0)
             mask_l_t = torch.from_numpy(mask_l).to(self.device).float().unsqueeze(0)
             mask_r_t = torch.from_numpy(mask_r).to(self.device).float().unsqueeze(0)
             if mask_l_t.max() > 1.0:
                 mask_l_t /= 255.0
                 mask_r_t /= 255.0
         else:
-            sbs_bgr_t = sbs_rgb.unsqueeze(0)
+            sbs_rgb_t = sbs_rgb.unsqueeze(0)
             mask_l_t = mask_l.unsqueeze(0)
             mask_r_t = mask_r.unsqueeze(0)
 
-        packed_t = self.pack_batch(sbs_bgr_t, mask_l_t, mask_r_t).squeeze(0)
+        packed_t = self.pack_batch(sbs_rgb_t, mask_l_t, mask_r_t).squeeze(0)
         
         if is_numpy:
             return packed_t.cpu().numpy()
@@ -622,7 +642,13 @@ def process_video_in_batches(
     hybrid_loop = HybridSam3MotionLoop(video_predictor=predictor, raft_compensator=RaftMotionCompensator(device="cuda"))
     total_frames, num_keyframes, width, height, duration, fps = metadata(video_path)
 
-    cap = cv2.VideoCapture(video_path)
+    # Use ffmpeg pipe directly to get rgb24 bytes
+    read_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", 
+        "-i", video_path, "-f", "image2pipe", "-pix_fmt", "rgb24", 
+        "-vcodec", "rawvideo", "-"
+    ]
+    reader = subprocess.Popen(read_cmd, stdout=subprocess.PIPE, bufsize=width*height*3*batch_size)
     writer = ffmpeg_pipe(out_path, width, height, fps)
     packer = AlphaCornerPacker(scale_factor=matte_size, device=hybrid_loop.device)
     hybrid_loop.raft._load_model()
@@ -630,13 +656,14 @@ def process_video_in_batches(
     frame_count = 0
     pbar = tqdm(total=total_frames, desc="Processing SBS Batches")
 
-    def propagate_eye(eye_frames_bgr, bbox):
-
-        tensors_rgb = []
+    def propagate_eye(eye_frames_tensor_rgb, bbox):
+        # eye_frames_tensor_rgb is float32 [B, 3, H, W] in [0, 1] on GPU
+        B, C, h, w = eye_frames_tensor_rgb.shape
         eye_masks = []
-        chunk_len = len(eye_frames_bgr)
-        h, w = eye_frames_bgr[0].shape[:2]
-        eye_frames_pil = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in eye_frames_bgr]
+        
+        # SAM3 requires PIL Images for start_session initialization
+        eye_frames_cpu = (eye_frames_tensor_rgb * 255.0).clamp(0, 255).to(torch.uint8).cpu()
+        eye_frames_pil = [TVF.to_pil_image(eye_frames_cpu[i]) for i in range(B)]
         
         res = hybrid_loop.predictor.handle_request(dict(type="start_session", resource_path=eye_frames_pil))
         sid = res["session_id"]
@@ -655,13 +682,8 @@ def process_video_in_batches(
         tracker_state = inference_state["tracker_inference_states"][0]
         hybrid_loop.predictor.model.tracker.propagate_in_video_preflight(tracker_state, run_mem_encoder=True)
         
-        for f_bgr in eye_frames_bgr:
-            f_rgb = cv2.cvtColor(f_bgr, cv2.COLOR_BGR2RGB)
-            t_rgb = torch.from_numpy(f_rgb).permute(2, 0, 1).float().div(255.0).to(hybrid_loop.device)
-            tensors_rgb.append(t_rgb)
-            
         prev_logits = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].to(hybrid_loop.device).float()
-        batch_size = len(tracker_state["obj_ids"])
+        batch_size_obj = len(tracker_state["obj_ids"])
         
         out_f0 = tracker_state["output_dict"]["cond_frame_outputs"][0]
         logits_f0 = out_f0["pred_masks_high_res"] if "pred_masks_high_res" in out_f0 else out_f0["pred_masks"]
@@ -675,12 +697,12 @@ def process_video_in_batches(
             logits_f0.to(hybrid_loop.device), size=(h, w), mode="bicubic", align_corners=False).squeeze(0).squeeze(0)
 
         prob_f0 = torch.sigmoid(f0_resized)
-        eye_masks.append((prob_f0 > 0.5).float())
+        eye_masks.append((prob_f0 > 0.5).to(torch.uint8))
         
-        with torch.inference_mode():
-            for frame_idx in range(1, chunk_len):
-                prev_tensor = tensors_rgb[frame_idx - 1]
-                curr_tensor = tensors_rgb[frame_idx]
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            for frame_idx in range(1, B):
+                prev_tensor = eye_frames_tensor_rgb[frame_idx - 1]
+                curr_tensor = eye_frames_tensor_rgb[frame_idx]
                 
                 hybrid_loop.predictor.model._prepare_backbone_feats(inference_state=inference_state,
                     frame_idx=frame_idx, reverse=False)
@@ -691,18 +713,18 @@ def process_video_in_batches(
                 flow_downscaled[0] *= (w_mask / w)
                 flow_downscaled[1] *= (h_mask / h)
                 
-                warped_logits = hybrid_loop.raft._warp_frame(prev_logits, flow_downscaled)
+                warped_logits = hybrid_loop.raft._warp_frame(prev_logits.bfloat16(), flow_downscaled).float()
                 
                 dummy_point_inputs = {
-                    "point_coords": torch.zeros(batch_size, 1, 2, device=hybrid_loop.device),
-                    "point_labels": -torch.ones(batch_size, 1, dtype=torch.int32, device=hybrid_loop.device)
+                    "point_coords": torch.zeros(batch_size_obj, 1, 2, device=hybrid_loop.device),
+                    "point_labels": -torch.ones(batch_size_obj, 1, dtype=torch.int32, device=hybrid_loop.device)
                 }
                 
                 current_out, _ = hybrid_loop.predictor.model.tracker._run_single_frame_inference(
                     inference_state=tracker_state,
                     output_dict=tracker_state["output_dict"],
                     frame_idx=frame_idx,
-                    batch_size=batch_size,
+                    batch_size=batch_size_obj,
                     is_init_cond_frame=False,
                     point_inputs=dummy_point_inputs,
                     mask_inputs=None,
@@ -723,89 +745,74 @@ def process_video_in_batches(
                 else:
                     logits_gpu = torch.zeros((1, 1, h, w), device=hybrid_loop.device)
                 
-                logits_resized = torch.nn.functional.interpolate(logits_gpu.to(hybrid_loop.device), size=(h, w), mode="bilinear", align_corners=False).squeeze(0).squeeze(0)
+                logits_resized = torch.nn.functional.interpolate(logits_gpu.to(hybrid_loop.device).float(), size=(h, w), mode="bilinear", align_corners=False).squeeze(0).squeeze(0)
                 prob = torch.sigmoid(logits_resized)
-                eye_masks.append((prob > 0.5).float())
+                eye_masks.append((prob > 0.5).to(torch.uint8))
                 
         hybrid_loop.predictor.handle_request(dict(type="close_session", session_id=sid))
+        torch.cuda.empty_cache()
         return eye_masks
 
+    frame_bytes = width * height * 3
+    
     while frame_count < total_frames:
-        frames_bgr = []
-        for _ in range(batch_size):
-            ret, frame = cap.read()
-            if not ret: break
-            frames_bgr.append(frame)
-            
-        if not frames_bgr:
+        raw_data = reader.stdout.read(frame_bytes * batch_size)
+        if not raw_data: 
             break
             
-        chunk_length = len(frames_bgr)
+        chunk_length = len(raw_data) // frame_bytes
+        if chunk_length == 0:
+            break
+            
+        # Parse straight to tensor on GPU
+        frames_tensor = torch.frombuffer(raw_data, dtype=torch.uint8).reshape(chunk_length, height, width, 3).to(hybrid_loop.device)
+        
         half_w = width // 2
-
-        frames_l_bgr = [f[:, :half_w] for f in frames_bgr]
-        frames_r_bgr = [f[:, half_w:] for f in frames_bgr]
+        # shapes: [B, H, W, 3] -> [B, 3, H, W]
+        frames_l_tensor = frames_tensor[:, :, :half_w, :].permute(0, 3, 1, 2)
+        frames_r_tensor = frames_tensor[:, :, half_w:, :].permute(0, 3, 1, 2)
 
         target_w = int(half_w * matte_size)
         target_h = int(height * matte_size)
         
-        frames_l_bgr_small = [cv2.resize(f, (target_w, target_h), interpolation=cv2.INTER_AREA) for f in frames_l_bgr]
-        frames_r_bgr_small = [cv2.resize(f, (target_w, target_h), interpolation=cv2.INTER_AREA) for f in frames_r_bgr]
+        # interpolate expects float [B, C, H, W]
+        frames_l_small = torch.nn.functional.interpolate(frames_l_tensor.float() / 255.0, size=(target_h, target_w), mode='area')
+        frames_r_small = torch.nn.functional.interpolate(frames_r_tensor.float() / 255.0, size=(target_h, target_w), mode='area')
         
         left_bbox_small = [
-            left_bbox[0] * matte_size,
-            left_bbox[1] * matte_size,
-            left_bbox[2] * matte_size,
-            left_bbox[3] * matte_size
+            left_bbox[0] * matte_size, left_bbox[1] * matte_size,
+            left_bbox[2] * matte_size, left_bbox[3] * matte_size
         ] if left_bbox is not None else None
         
         right_bbox_small = [
-            right_bbox[0] * matte_size,
-            right_bbox[1] * matte_size,
-            right_bbox[2] * matte_size,
-            right_bbox[3] * matte_size
+            right_bbox[0] * matte_size, right_bbox[1] * matte_size,
+            right_bbox[2] * matte_size, right_bbox[3] * matte_size
         ] if right_bbox is not None else None
         
         print(f"\n[SBS] Tracking Left Eye Batch (Frames {frame_count} to {frame_count+chunk_length-1}) at {int(matte_size*100)}% scale...")
-
-        if use_class_process_batch:
-            eye_frames_pil_l = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_l_bgr_small]
-
-            masks_l = hybrid_loop.process_batch(
-                frames_pil=eye_frames_pil_l,
-                frames_bgr=frames_l_bgr_small,
-                prompt_text=prompt_text,
-                bbox=left_bbox_small)
-        else:
-            masks_l = propagate_eye(frames_l_bgr_small, left_bbox_small)
+        masks_l = propagate_eye(frames_l_small, left_bbox_small)
 
         print(f"[SBS] Tracking Right Eye Batch (Frames {frame_count} to {frame_count+chunk_length-1}) creating mattes at {int(matte_size*100)}% scale...")
+        masks_r = propagate_eye(frames_r_small, right_bbox_small)
 
-        if use_class_process_batch:
-            eye_frames_pil_r = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_r_bgr_small]
-            masks_r = hybrid_loop.process_batch(
-                frames_pil=eye_frames_pil_r,
-                frames_bgr=frames_r_bgr_small,
-                prompt_text=prompt_text,
-                bbox=right_bbox_small)
-        else:
-            masks_r = propagate_eye(frames_r_bgr_small, right_bbox_small)
-
-        frames_tensor = torch.from_numpy(np.stack(frames_bgr)).to(hybrid_loop.device)
         masks_l_tensor = torch.stack(masks_l)
         masks_r_tensor = torch.stack(masks_r)
 
-        packed_batch = packer.pack_batch(frames_tensor, masks_l_tensor, masks_r_tensor)
+        # packer.pack_batch expects [B, H, W, 3]
+        packed_batch = packer.pack_batch(frames_tensor, masks_l_tensor.float(), masks_r_tensor.float())
         packed_bytes = packed_batch.cpu().numpy().tobytes()
         writer.stdin.write(packed_bytes)
             
-        del frames_tensor, masks_l_tensor, masks_r_tensor, packed_batch
+        del frames_tensor, frames_l_tensor, frames_r_tensor, frames_l_small, frames_r_small
+        del masks_l_tensor, masks_r_tensor, packed_batch
         del masks_l, masks_r
+        torch.cuda.empty_cache()
         
         frame_count += chunk_length
         pbar.update(chunk_length)
         
-    cap.release()
+    reader.stdout.close()
+    reader.wait()
     writer.stdin.close()
     writer.wait()
     print("Stereoscopic chunked processing complete!")
