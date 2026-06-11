@@ -110,6 +110,12 @@ def process_single_eye_video(
     prev_tensor = torch.from_numpy(prev_frame_rgb).permute(2, 0, 1).float().div(255.0).to(hybrid_loop.device)
 
     prev_logits = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].to(hybrid_loop.device).float()
+    if prev_logits.shape[0] > 0:
+        prev_logits = prev_logits[0:1]
+    else:
+        h_mask = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].shape[2]
+        w_mask = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].shape[3]
+        prev_logits = torch.zeros((1, 1, h_mask, w_mask), device=hybrid_loop.device)
 
     with torch.inference_mode():
         for frame_idx in tqdm(range(1, total_frames), desc="Processing Single Eye"):
@@ -161,9 +167,17 @@ def process_single_eye_video(
             tracker_state["frames_already_tracked"][frame_idx] = {"reverse": False}
 
             prev_logits = current_out["pred_masks"].to(hybrid_loop.device).float()
+            if prev_logits.shape[0] > 0:
+                prev_logits = prev_logits[0:1]
+            else:
+                prev_logits = torch.zeros((1, 1, h_mask, w_mask), device=hybrid_loop.device)
             prev_tensor = curr_tensor
 
             logits_gpu = current_out["pred_masks_high_res"] if "pred_masks_high_res" in current_out else current_out["pred_masks"]
+            if logits_gpu.shape[0] > 0:
+                logits_gpu = logits_gpu[0:1]
+            else:
+                logits_gpu = torch.zeros((1, 1, height, width), device=hybrid_loop.device)
             logits_resized = torch.nn.functional.interpolate(
                 logits_gpu.to(hybrid_loop.device),
                 size=(height, width),
@@ -391,6 +405,12 @@ class HybridSam3MotionLoop:
             tensors_rgb.append(t_rgb)
 
         prev_logits = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].to(self.device).float()
+        if prev_logits.shape[0] > 0:
+            prev_logits = prev_logits[0:1]
+        else:
+            h_mask = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].shape[2]
+            w_mask = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].shape[3]
+            prev_logits = torch.zeros((1, 1, h_mask, w_mask), device=self.device)
 
         self.predictor.model.tracker.propagate_in_video_preflight(
             tracker_state, run_mem_encoder=True
@@ -443,6 +463,10 @@ class HybridSam3MotionLoop:
                 tracker_state["frames_already_tracked"][frame_idx] = {"reverse": False}
 
                 prev_logits = current_out["pred_masks"].to(self.device).float()
+                if prev_logits.shape[0] > 0:
+                    prev_logits = prev_logits[0:1]
+                else:
+                    prev_logits = torch.zeros((1, 1, h_mask, w_mask), device=self.device)
 
         final_masks = []
 
@@ -451,6 +475,10 @@ class HybridSam3MotionLoop:
             out = tracker_state["output_dict"][storage_key][i]
             
             logits_gpu = out["pred_masks_high_res"].to(self.device) if "pred_masks_high_res" in out else out["pred_masks"].to(self.device)
+            if logits_gpu.shape[0] > 0:
+                logits_gpu = logits_gpu[0:1]
+            else:
+                logits_gpu = torch.zeros((1, 1, height, width), device=self.device)
             logits_resized = torch.nn.functional.interpolate(
                 logits_gpu,
                 size=(height, width),
@@ -645,11 +673,21 @@ def process_video_in_batches(
             tensors_rgb.append(t_rgb)
             
         prev_logits = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].to(hybrid_loop.device).float()
+        if prev_logits.shape[0] > 0:
+            prev_logits = prev_logits[0:1]
+        else:
+            h_mask = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].shape[2]
+            w_mask = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].shape[3]
+            prev_logits = torch.zeros((1, 1, h_mask, w_mask), device=hybrid_loop.device)
         
         eye_masks = []
         
         out_f0 = tracker_state["output_dict"]["cond_frame_outputs"][0]
         logits_f0 = out_f0["pred_masks_high_res"] if "pred_masks_high_res" in out_f0 else out_f0["pred_masks"]
+        if logits_f0.shape[0] > 0:
+            logits_f0 = logits_f0[0:1]
+        else:
+            logits_f0 = torch.zeros((1, 1, height, half_w), device=hybrid_loop.device)
         logits_f0_resized = torch.nn.functional.interpolate(
             logits_f0.to(hybrid_loop.device),
             size=(height, half_w),
@@ -706,8 +744,16 @@ def process_video_in_batches(
                 tracker_state["frames_already_tracked"][frame_idx] = {"reverse": False}
                 
                 prev_logits = current_out["pred_masks"].to(hybrid_loop.device).float()
+                if prev_logits.shape[0] > 0:
+                    prev_logits = prev_logits[0:1]
+                else:
+                    prev_logits = torch.zeros((1, 1, h_mask, w_mask), device=hybrid_loop.device)
                 
                 logits_gpu = current_out["pred_masks_high_res"] if "pred_masks_high_res" in current_out else current_out["pred_masks"]
+                if logits_gpu.shape[0] > 0:
+                    logits_gpu = logits_gpu[0:1]
+                else:
+                    logits_gpu = torch.zeros((1, 1, height, half_w), device=hybrid_loop.device)
                 logits_resized = torch.nn.functional.interpolate(
                     logits_gpu.to(hybrid_loop.device),
                     size=(height, half_w),
@@ -774,8 +820,8 @@ def process_video_in_batches(
     print("Stereoscopic chunked processing complete!")
 
 process_video_in_batches(
-    video_path="test_sbs.mp4",
-    out_path="test_sbs_out.mp4",
+    video_path="video.mp4",
+    out_path="video_out.mp4",
     prompt_text="One girl",
     batch_size=100,
     use_class_process_batch=False
