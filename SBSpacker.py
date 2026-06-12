@@ -229,9 +229,9 @@ def ffmpeg_pipe(out_path, width, height, fps):
     ffmpeg_cmd = [
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
         '-s', f'{width}x{height}', '-pix_fmt', 'bgr24', '-r', str(fps),
-        '-i', '-', '-c:v', 'hevc_nvenc', '-preset', 'fast', '-cq', '16',
-        '-pix_fmt', 'yuv420p', '-colorspace', 'bt709', '-color_primaries', 'bt709',
-        '-color_trc', 'bt709', '-color_range', 'tv', out_path
+        '-hwaccel', 'cuda', '-i', '-', '-c:v', 'hevc_nvenc', '-profile:v', 'main10', '-pix_fmt', 'p010le', '-tag:v', 'hvc1', '-g', '30', '-rc', 'cbr', '-b:v', '100M', '-preset', 'p6', '-cq', '16',
+        '-colorspace', 'bt709', '-color_primaries', 'bt709', '-fps_mode', 'cfr', '-r', str(fps), '-movflags', '+faststart+write_colr+use_metadata_tags',
+        '-metadata:s:v:0', 'stereo_mode=left_right', '-color_trc', 'bt709', '-color_range', 'pc', out_path
     ]
     return subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
@@ -923,11 +923,58 @@ def process_videos(
     writer.wait()
     print("Stereoscopic chunked processing complete!")
 
-process_videos(
-    video_path="vid.mp4",
-    out_path="out.mp4",
-    prompt_text="",
-    batch_size=50,
-    matte_size=0.4,
-    motion_guided_prompt=True
-)
+import os
+import glob
+import gc
+
+def process_directory(input_dir, output_dir, **kwargs):
+    os.makedirs(output_dir, exist_ok=True)
+
+    video_files = []
+    for ext in ["*.mp4", "*.mkv", "*.mov", "*.avi"]:
+        video_files.extend(glob.glob(os.path.join(input_dir, ext)))
+    
+    if not video_files:
+        print(f"No videos found in {input_dir}")
+        return
+        
+    print(f"Found {len(video_files)} videos in {input_dir}")
+    
+    for i, video_path in enumerate(video_files):
+        filename = os.path.basename(video_path)
+        out_path = os.path.join(output_dir, f"{os.path.splitext(filename)[0]}_masked.mp4")
+        
+        print(f"\n=======================================================")
+        print(f"[{i+1}/{len(video_files)}] Processing: {filename}")
+        print(f"=======================================================")
+        
+        if os.path.exists(out_path):
+            print(f"Skipping {filename}, output already exists at {out_path}")
+            continue
+            
+        try:
+            process_videos(
+                video_path=video_path,
+                out_path=out_path,
+                **kwargs
+            )
+        except Exception as e:
+            print(f"Error processing {filename}: {e}")
+            
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+if __name__ == "__main__":
+
+    INPUT_FOLDER = "assets/video_segments"
+    OUTPUT_FOLDER = "assets/matted_segments"
+    
+    process_directory(
+        input_dir=INPUT_FOLDER,
+        output_dir=OUTPUT_FOLDER,
+        prompt_text="One girl",
+        batch_size=50,
+        matte_size=0.4,
+        motion_guided_prompt=True
+    )
