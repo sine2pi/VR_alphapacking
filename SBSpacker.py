@@ -114,10 +114,12 @@ def feather_mask(mask: torch.Tensor, blur_radius: float = 1.5, iterations: int =
     return x.view(orig_shape) 
 
 def morph3x3(mask: torch.Tensor, dilation: int) -> torch.Tensor:
+    
     if dilation == 0: return mask
     x = mask.float().view(1, 1, *mask.shape) if mask.ndim == 2 else mask
     k_size = 2 * abs(dilation) + 1
     padding = abs(dilation)
+    
     if dilation > 0:
         x = torch.nn.functional.max_pool2d(x, kernel_size=k_size, stride=1, padding=padding)
     else:
@@ -136,7 +138,6 @@ def mask_edges(mask: torch.Tensor, kernel_size: int = 1) -> torch.Tensor:
         x = x[None, ...]
         
     x = (x > 0.5).float()
-    
     pad = kernel_size // 2
     k_size = pad * 2 + 1
     
@@ -277,8 +278,8 @@ class RaftMotionCompensator:
             
         with torch.autocast(device_type=self.device.type, dtype=torch.float16 if self.device.type == 'cuda' else torch.float32):
             flow = self.model(img1_t, img2_t)[-1].float()
-        flow = torch.nan_to_num(flow, nan=0.0, posinf=0.0, neginf=0.0)
 
+        flow = torch.nan_to_num(flow, nan=0.0, posinf=0.0, neginf=0.0)
         if pad_h > 0 or pad_w > 0:
             flow = flow[:, :, :H_s, :W_s]
 
@@ -487,7 +488,7 @@ class HybridSam3MotionLoop:
         self.predictor.model.tracker.propagate_in_video_preflight(
             tracker_state, run_mem_encoder=True)
 
-        with torch.inference_mode():
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             for frame_idx in range(1, chunk_length):
                 prev_tensor = tensors_rgb[frame_idx - 1]
                 curr_tensor = tensors_rgb[frame_idx]
@@ -546,11 +547,11 @@ class HybridSam3MotionLoop:
                 mode="bilinear",
                 align_corners=False).squeeze(0).squeeze(0)
             
-            prob = torch.sigmoid(logits_resized).cpu().numpy()
-            final_masks.append((prob > 0.5).astype(np.uint8) * 255)
+            prob = torch.sigmoid(logits_resized)
+            final_masks.append(((prob > 0.5) * 255).to(torch.uint8).cpu().numpy())
 
         self.predictor.handle_request(dict(type="close_session", session_id=sid_inline))
-        print(f"[DEBUG] Final masks sums for first 5 frames: {[np.sum(final_masks[i]) for i in range(min(5, chunk_length))]}")
+        # print(f"[DEBUG] Final masks sums for first 5 frames: {[np.sum(final_masks[i]) for i in range(min(5, chunk_length))]}")
         return final_masks
 
 class AlphaCornerPacker:
@@ -704,7 +705,6 @@ def process_videos(
     pbar = tqdm(total=total_frames, desc="Processing SBS Batches")
 
     def propagate_eye(eye_frames_bgr, bbox, prior_mask=None):
-
         chunk_len = len(eye_frames_bgr)
         h, w = eye_frames_bgr[0].shape[:2]
         eye_frames_pil = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in eye_frames_bgr]
@@ -767,10 +767,10 @@ def process_videos(
             logits_f0 = torch.zeros((1, 1, h, w), device=hybrid_loop.device)
 
         f0_resized = torch.nn.functional.interpolate(logits_f0.to(hybrid_loop.device), size=(h, w), mode="bicubic", align_corners=False).squeeze(0).squeeze(0)
-        prob_f0 = torch.sigmoid(f0_resized).cpu().numpy()
-        eye_masks.append((prob_f0 > 0.5).astype(np.uint8) * 255)
+        prob_f0 = torch.sigmoid(f0_resized)
+        eye_masks.append(((prob_f0 > 0.5) * 255).to(torch.uint8).cpu().numpy())
         
-        with torch.inference_mode():
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             for frame_idx in range(1, chunk_len):
                 prev_tensor = tensors_rgb[frame_idx - 1]
                 curr_tensor = tensors_rgb[frame_idx]
@@ -791,7 +791,6 @@ def process_videos(
                 flow_downscaled[1] *= (h_mask / h)
                 
                 warped_logits = hybrid_loop.raft._warp_frame(prev_logits, flow_downscaled)
-                
                 dummy_point_inputs = {
                     "point_coords": torch.zeros(batch_size, 1, 2, device=hybrid_loop.device),
                     "point_labels": -torch.ones(batch_size, 1, dtype=torch.int32, device=hybrid_loop.device)}
@@ -828,8 +827,8 @@ def process_videos(
                     mode="bilinear",
                     align_corners=False).squeeze(0).squeeze(0)
 
-                prob = torch.sigmoid(logits_resized).cpu().numpy()
-                eye_masks.append((prob > 0.5).astype(np.uint8) * 255)
+                prob = torch.sigmoid(logits_resized)
+                eye_masks.append(((prob > 0.5) * 255).to(torch.uint8).cpu().numpy())
                 
         hybrid_loop.predictor.handle_request(dict(type="close_session", session_id=sid))
         return eye_masks
@@ -848,7 +847,6 @@ def process_videos(
             break
             
         chunk_length = len(frames_bgr)
-        
         frames_l_bgr = [f[:, :half_w] for f in frames_bgr]
         frames_r_bgr = [f[:, half_w:] for f in frames_bgr]
 
@@ -877,7 +875,6 @@ def process_videos(
         
         if motion_guided_prompt:
             eye_frames_pil_l = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_l_bgr_small]
-            
             masks_l = hybrid_loop.process_batch(
                 frames_pil=eye_frames_pil_l,
                 frames_bgr=frames_l_bgr_small,
@@ -887,8 +884,8 @@ def process_videos(
             )
         else:
             masks_l = propagate_eye(frames_l_bgr_small, left_bbox_small, prior_mask=valid_prior_l)
-        torch.cuda.empty_cache()
         
+        torch.cuda.empty_cache()
         print(f"[SBS] Tracking Right Eye Batch (Frames {frame_count} to {frame_count+chunk_length-1}) creating mattes at {int(matte_size*100)}% scale...")
         valid_prior_r = last_mask_r if (last_mask_r is not None and np.sum(last_mask_r) > 0) else None
         
@@ -966,7 +963,6 @@ def process_directory(input_dir, output_dir, **kwargs):
             torch.cuda.empty_cache()
 
 if __name__ == "__main__":
-
     INPUT_FOLDER = "assets/video_segments"
     OUTPUT_FOLDER = "assets/matted_segments"
     
