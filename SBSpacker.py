@@ -1,4 +1,4 @@
-import cv2, torch, subprocess, numpy as np, json, logging
+import cv2, torch, subprocess, numpy as np, json, logging, os, glob, gc
 import torch.nn.functional as F
 from tqdm import tqdm
 from PIL import Image
@@ -230,7 +230,7 @@ def ffmpeg_pipe(out_path, width, height, fps):
     ffmpeg_cmd = [
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
         '-s', f'{width}x{height}', '-pix_fmt', 'bgr24', '-r', str(fps),
-        '-hwaccel', 'cuda', '-i', '-', '-c:v', 'hevc_nvenc', '-profile:v', 'main10', '-pix_fmt', 'p010le', '-tag:v', 'hvc1', '-g', '30', '-rc', 'cbr', '-b:v', '100M', '-preset', 'p6', '-cq', '16',
+        '-i', '-', '-c:v', 'hevc_qsv', '-profile:v', 'main10', '-pix_fmt', 'p010le', '-tag:v', 'hvc1', '-g', '30', '-b:v', '100M', '-preset', 'veryslow',
         '-colorspace', 'bt709', '-color_primaries', 'bt709', '-fps_mode', 'cfr', '-r', str(fps), '-movflags', '+faststart+write_colr+use_metadata_tags',
         '-metadata:s:v:0', 'stereo_mode=left_right', '-color_trc', 'bt709', '-color_range', 'pc', out_path
     ]
@@ -671,6 +671,7 @@ class AlphaCornerPacker:
 def process_videos(
     video_path, 
     out_path, 
+    out_mask_path=None,
     left_bbox=None, 
     right_bbox=None,
     prompt_text=None,
@@ -698,6 +699,7 @@ def process_videos(
     total_frames, num_keyframes, width, height, duration, fps = metadata(video_path)
     cap = cv2.VideoCapture(video_path)
     writer = ffmpeg_pipe(out_path, width, height, fps)
+    mask_writer = ffmpeg_pipe(out_mask_path, width, height, fps) if out_mask_path else None
     half_w = width // 2
     packer = AlphaCornerPacker(scale_factor=matte_size)
     hybrid_loop.raft._load_model()
@@ -912,17 +914,24 @@ def process_videos(
             packed_frame = packer.pack_frame(frames_bgr[i], masks_l[i],masks_r[i])
             writer.stdin.write(packed_frame.astype(np.uint8).tobytes())
             
+            if mask_writer is not None:
+                full_mask_l = cv2.resize(masks_l[i], (half_w, height), interpolation=cv2.INTER_LINEAR)
+                full_mask_r = cv2.resize(masks_r[i], (half_w, height), interpolation=cv2.INTER_LINEAR)
+                red_sbs = np.zeros((height, width, 3), dtype=np.uint8)
+                red_sbs[:, :half_w, 2] = full_mask_l
+                red_sbs[:, half_w:, 2] = full_mask_r
+                mask_writer.stdin.write(red_sbs.tobytes())
+            
         frame_count += chunk_length
         pbar.update(chunk_length)
         
     cap.release()
     writer.stdin.close()
     writer.wait()
+    if mask_writer is not None:
+        mask_writer.stdin.close()
+        mask_writer.wait()
     print("Stereoscopic chunked processing complete!")
-
-import os
-import glob
-import gc
 
 def process_directory(input_dir, output_dir, **kwargs):
     os.makedirs(output_dir, exist_ok=True)
@@ -939,20 +948,23 @@ def process_directory(input_dir, output_dir, **kwargs):
     
     for i, video_path in enumerate(video_files):
         filename = os.path.basename(video_path)
-        out_path = os.path.join(output_dir, f"{os.path.splitext(filename)[0]}_masked.mp4")
+        base_name = os.path.splitext(filename)[0]
+        out_path = os.path.join(output_dir, f"{base_name}_masked.mp4")
+        out_mask_path = os.path.join(output_dir, f"{base_name}_redmask.mp4")
         
         print(f"\n=======================================================")
         print(f"[{i+1}/{len(video_files)}] Processing: {filename}")
         print(f"=======================================================")
         
-        if os.path.exists(out_path):
-            print(f"Skipping {filename}, output already exists at {out_path}")
+        if os.path.exists(out_path) and os.path.exists(out_mask_path):
+            print(f"Skipping {filename}, outputs already exist.")
             continue
             
         try:
             process_videos(
                 video_path=video_path,
                 out_path=out_path,
+                out_mask_path=out_mask_path,
                 **kwargs
             )
         except Exception as e:
@@ -974,3 +986,30 @@ if __name__ == "__main__":
         matte_size=0.4,
         motion_guided_prompt=True
     )
+
+    # if apply_temporal_disambiguation:
+    #     model = Sam3VideoInferenceWithInstanceInteractivity(
+    #         detector=detector,
+    #         tracker=tracker,
+    #         score_threshold_detection=0.65,
+    #         assoc_iou_thresh=0.3,
+    #         det_nms_thresh=0.1,
+    #         new_det_thresh=0.99,
+    #         hotstart_delay=8,
+    #         hotstart_unmatch_thresh=5,
+    #         hotstart_dup_thresh=5,
+    #         suppress_unmatched_only_within_hotstart=False,
+    #         min_trk_keep_alive=-1,
+    #         max_trk_keep_alive=100,
+    #         init_trk_keep_alive=5,
+    #         suppress_overlapping_based_on_recent_occlusion_threshold=0.9,
+    #         suppress_det_close_to_boundary=True,
+    #         fill_hole_area=4,
+    #         recondition_every_nth_frame=64,
+    #         masklet_confirmation_enable=True,
+    #         decrease_trk_keep_alive_for_empty_masklets=True,
+    #         image_size=1008,
+    #         image_mean=(0.5, 0.5, 0.5),
+    #         image_std=(0.5, 0.5, 0.5),
+    #         compile_model=compile,
+    #     )
