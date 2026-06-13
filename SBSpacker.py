@@ -422,8 +422,8 @@ def motion_compensated(pt_frames, indices, threads=0, threshold=0.05, chunk_size
             img1 = pt_frames[i:i+1].to(device)
             img2 = pt_frames[i+1:i+2].to(device)
 
-            flow_fwd =  compute_raft_flow(model, transforms, img1, img2, device, max_size=max_size, interp_mode=interp_mode, scale_factor=scale_factor)
-            flow_bwd =  compute_raft_flow(model, transforms, img2, img1, device, max_size=max_size, interp_mode=interp_mode, scale_factor=scale_factor)
+            flow_fwd = compute_raft_flow(img1, img2, max_size=max_size, scale_factor=scale_factor, interp_mode=interp_mode)
+            flow_bwd = compute_raft_flow(img2, img1, max_size=max_size, scale_factor=scale_factor, interp_mode=interp_mode)
 
             flow_fwd_cache[i] = flow_fwd.squeeze(0).cpu()
             flow_bwd_cache[i] = flow_bwd.squeeze(0).cpu()
@@ -482,9 +482,6 @@ class AlphaCornerPacker:
         self.padding = padding
         self.vignette_cache = None
 
-   
-
-
     def pack_frame(self, sbs_rgb, mask_l, mask_r):
 
         dilation = 0
@@ -513,7 +510,6 @@ class AlphaCornerPacker:
         else:
             r_small = mask_r
 
- 
         mask_l_vignette = l_small.astype(np.uint8) 
         mask_r_vignette = r_small.astype(np.uint8) 
 
@@ -605,7 +601,7 @@ def propagate_eye(predictor, frames_pil, frames_bgr, prompt_text, bbox, prior_ma
         
     if prompt_text is not None or bbox is not None or prior_mask is None:
         predictor.handle_request(prompt_req)
-    
+
     out_buffer = []
     for st in predictor.handle_stream_request(dict(
         type="propagate_in_video",
@@ -652,157 +648,6 @@ def propagate_eye(predictor, frames_pil, frames_bgr, prompt_text, bbox, prior_ma
         final_masks = [(m > 0.5).astype(np.uint8) * 255 for m in sam_masks]
         
     return final_masks
-
-def process_videos(video_path, out_path, out_mask_path=None, left_bbox=None, right_bbox=None, prompt_text=None,
-    batch_size=100, matte_size=0.4, motion_guided_prompt=False, magnitude=False, meld=False, allthethings=False):
-
-    predictor = build_sam3_video_predictor(
-        has_presence_token=False,
-        geo_encoder_use_img_cross_attn=True,
-        strict_state_dict_loading=False,
-        async_loading_frames=True,
-        video_loader_type="ffmpeg",
-        offload_video_to_cpu = True,
-        apply_temporal_disambiguation = True,
-        compile = False,
-    )
-
-    total_frames, num_keyframes, width, height, duration, fps = metadata(video_path)
-    print(f'width', width)
-    print(f'height', height)
-    cap = cv2.VideoCapture(video_path)
-    writer = ffmpeg_pipe(out_path, width, height, fps)
-    mask_writer = ffmpeg_pipe(out_mask_path, width, height, fps) if out_mask_path else None
-    half_w = width // 2
-    packer = AlphaCornerPacker(scale_factor=matte_size)
-    weights = Raft_Small_Weights.DEFAULT
-    transforms = weights.transforms()
-    model = raft_small(weights=weights, progress=False).to(device).eval()
-    frame_count = 0
-    pbar = tqdm(total=total_frames, desc="Processing SBS Batches")
-
-    last_mask_l = None
-    last_mask_r = None
-
-    if mask_writer is not None:
-        red_sbs = np.zeros((height, width, 3), dtype=np.uint8)
-        full_mask_l = np.empty((height, half_w), dtype=np.uint8)
-        full_mask_r = np.empty((height, half_w), dtype=np.uint8)
-
-    while frame_count < total_frames:
-        frames_bgr = []
-        for _ in range(batch_size):
-            ret, frame = cap.read()
-            if not ret: break
-            frames_bgr.append(frame)
-            
-        if not frames_bgr:
-            break
-            
-        chunk = len(frames_bgr)
-        frames_l_bgr = [f[:, :half_w] for f in frames_bgr]
-        frames_r_bgr = [f[:, half_w:] for f in frames_bgr]
-
-        track_size = 1008
-        track_h, track_w = target_shape((height, half_w), track_size)
-        
-        frames_l = [cv2.resize(f, (track_w, track_h), interpolation=cv2.INTER_AREA) for f in frames_l_bgr]
-        frames_r = [cv2.resize(f, (track_w, track_h), interpolation=cv2.INTER_AREA) for f in frames_r_bgr]
-        
-        scale_w = track_w / half_w
-        scale_h = track_h / height
-        
-        left_bbox_small = [
-            left_bbox[0] * scale_w,
-            left_bbox[1] * scale_h,
-            left_bbox[2] * scale_w,
-            left_bbox[3] * scale_h
-        ] if left_bbox is not None else None
-        
-        right_bbox_small = [
-            right_bbox[0] * scale_w,
-            right_bbox[1] * scale_h,
-            right_bbox[2] * scale_w,
-            right_bbox[3] * scale_h
-        ] if right_bbox is not None else None
-        
-        valid_prior_l = last_mask_l if (last_mask_l is not None and np.sum(last_mask_l) > 0) else None
-        eye_frames_pil_l = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_l]
-        
-        if motion_guided_prompt:
-            
-            masks_l = process_batch(
-                predictor=predictor,
-                frames_pil=eye_frames_pil_l,
-                frames_bgr=frames_l,
-                prompt_text=prompt_text,
-                bbox=left_bbox_small,
-                prior_mask=valid_prior_l
-            )
-        else:
-            masks_l = propagate_eye(                           
-                predictor=predictor,
-                frames_pil=eye_frames_pil_l,
-                frames_bgr=frames_l,
-                prompt_text=prompt_text,
-                bbox=left_bbox_small,
-                prior_mask=valid_prior_l
-                )
-        
-        torch.cuda.empty_cache()
-
-        valid_prior_r = last_mask_r if (last_mask_r is not None and np.sum(last_mask_r) > 0) else None
-        eye_frames_pil_r = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_r]
-
-        if motion_guided_prompt:
-            
-            masks_r = process_batch(
-                predictor=predictor,
-                frames_pil=eye_frames_pil_r,
-                frames_bgr=frames_r,
-                prompt_text=prompt_text,
-                bbox=right_bbox_small,
-                prior_mask=valid_prior_r
-            )
-        else:
-            masks_r = propagate_eye(                
-                predictor=predictor,
-                frames_pil=eye_frames_pil_r,
-                frames_bgr=frames_r,
-                prompt_text=prompt_text,
-                bbox=right_bbox_small,
-                prior_mask=valid_prior_r
-                )
-        torch.cuda.empty_cache()
-        
-        last_mask_l = masks_l[-1]
-        last_mask_r = masks_r[-1]
-
-        masks_l = apply_effects(masks_l, dilation=0, feather_radius=0.5, smooth_edges=1)
-        masks_r = apply_effects(masks_r, dilation=0, feather_radius=0.5, smooth_edges=1)
-
-        for i in range(chunk):
-            packed_frame = packer.pack_frame(frames_bgr[i], masks_l[i],masks_r[i])
-            writer.stdin.write(packed_frame.astype(np.uint8).tobytes())
-            
-            if mask_writer is not None:
-                cv2.resize(masks_l[i], (half_w, height), dst=full_mask_l, interpolation=cv2.INTER_LINEAR)
-                cv2.resize(masks_r[i], (half_w, height), dst=full_mask_r, interpolation=cv2.INTER_LINEAR)
-                red_sbs[:, :half_w, 2] = full_mask_l
-                red_sbs[:, half_w:, 2] = full_mask_r
-                mask_writer.stdin.write(red_sbs.tobytes())
-            
-        frame_count += chunk
-        pbar.update(chunk)
-        
-    cap.release()
-    writer.stdin.close()
-    writer.wait()
-
-    if mask_writer is not None:
-        mask_writer.stdin.close()
-        mask_writer.wait()
-    print("Stereoscopic chunked processing complete!")
 
 def process_batch(predictor, frames_pil, frames_bgr, prompt_text=None, bbox=None, prior_mask=None):
     
@@ -922,6 +767,153 @@ def process_batch(predictor, frames_pil, frames_bgr, prompt_text=None, bbox=None
     predictor.handle_request(dict(type="close_session", session_id=sid_inline))
     return final_masks
 
+def process_videos(
+    video_path, out_path, out_mask_path=None,
+    left_bbox=None, right_bbox=None,
+    prompt_text=None,
+    batch_size=100,
+    matte_size=0.4,
+    motion_guided_prompt=False
+):
+
+    predictor = build_sam3_video_predictor(
+        has_presence_token=False,
+        geo_encoder_use_img_cross_attn=True,
+        strict_state_dict_loading=False,
+        async_loading_frames=True,
+        video_loader_type="ffmpeg",
+        offload_video_to_cpu = True,
+        apply_temporal_disambiguation = True,
+        compile = False,
+    )
+
+    total_frames, num_keyframes, width, height, duration, fps = metadata(video_path)
+    cap = cv2.VideoCapture(video_path)
+    writer = ffmpeg_pipe(out_path, width, height, fps)
+    mask_writer = ffmpeg_pipe(out_mask_path, width, height, fps) if out_mask_path else None
+    half_w = width // 2
+    packer = AlphaCornerPacker(scale_factor=matte_size)
+
+    frame_count = 0
+    pbar = tqdm(total=total_frames, desc="Processing SBS Batches")
+
+    last_mask_l = None
+    last_mask_r = None
+
+    while frame_count < total_frames:
+        frames_bgr = []
+        for _ in range(batch_size):
+            ret, frame = cap.read()
+            if not ret: break
+            frames_bgr.append(frame)
+            
+        if not frames_bgr:
+            break
+            
+        chunk_length = len(frames_bgr)
+        frames_l_bgr = [f[:, :half_w] for f in frames_bgr]
+        frames_r_bgr = [f[:, half_w:] for f in frames_bgr]
+
+        target_w = int(half_w * matte_size)
+        target_h = int(height * matte_size)
+        
+
+        frames_l_bgr_small = [cv2.resize(f, (target_w, target_h), interpolation=cv2.INTER_AREA) for f in frames_l_bgr]
+        frames_r_bgr_small = [cv2.resize(f, (target_w, target_h), interpolation=cv2.INTER_AREA) for f in frames_r_bgr]
+        
+        left_bbox_small = [
+            left_bbox[0] * matte_size,
+            left_bbox[1] * matte_size,
+            left_bbox[2] * matte_size,
+            left_bbox[3] * matte_size
+        ] if left_bbox is not None else None
+        
+        right_bbox_small = [
+            right_bbox[0] * matte_size,
+            right_bbox[1] * matte_size,
+            right_bbox[2] * matte_size,
+            right_bbox[3] * matte_size
+        ] if right_bbox is not None else None
+        
+        print(f"\n[SBS] Tracking Left Eye Batch (Frames {frame_count} to {frame_count+chunk_length-1}) at {int(matte_size*100)}% scale...")
+        valid_prior_l = last_mask_l if (last_mask_l is not None and np.sum(last_mask_l) > 0) else None
+        eye_frames_pil_l = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_l_bgr_small]
+
+        if motion_guided_prompt:
+            
+            masks_l = process_batch(
+                predictor=predictor,
+                frames_pil=eye_frames_pil_l,
+                frames_bgr=frames_l_bgr_small,
+                prompt_text=prompt_text,
+                bbox=left_bbox_small,
+                prior_mask=valid_prior_l
+            )
+        else:
+            masks_l = propagate_eye(                           
+                predictor=predictor,
+                frames_pil=eye_frames_pil_l,
+                frames_bgr=frames_l_bgr_small,
+                prompt_text=prompt_text,
+                bbox=left_bbox_small,
+                prior_mask=valid_prior_l
+                )
+        
+        torch.cuda.empty_cache()
+        print(f"[SBS] Tracking Right Eye Batch (Frames {frame_count} to {frame_count+chunk_length-1}) creating mattes at {int(matte_size*100)}% scale...")
+        valid_prior_r = last_mask_r if (last_mask_r is not None and np.sum(last_mask_r) > 0) else None
+        eye_frames_pil_r = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_r_bgr_small]
+        if motion_guided_prompt:
+            masks_r = process_batch(
+                predictor=predictor,
+                frames_pil=eye_frames_pil_r,
+                frames_bgr=frames_r_bgr_small,
+                prompt_text=prompt_text,
+                bbox=right_bbox_small,
+                prior_mask=valid_prior_r
+            )
+        else:
+            masks_r = propagate_eye(                
+                predictor=predictor,
+                frames_pil=eye_frames_pil_r,
+                frames_bgr=frames_r_bgr_small,
+                prompt_text=prompt_text,
+                bbox=right_bbox_small,
+                prior_mask=valid_prior_r
+                )
+
+        torch.cuda.empty_cache()
+        
+        last_mask_l = masks_l[-1]
+        last_mask_r = masks_r[-1]
+
+        masks_l = apply_effects(masks_l, dilation=0, feather_radius=0.5, smooth_edges=1)
+        masks_r = apply_effects(masks_r, dilation=0, feather_radius=0.5, smooth_edges=1)
+
+        for i in range(chunk_length):
+            packed_frame = packer.pack_frame(frames_bgr[i], masks_l[i],masks_r[i])
+            writer.stdin.write(packed_frame.astype(np.uint8).tobytes())
+            
+            if mask_writer is not None:
+                full_mask_l = cv2.resize(masks_l[i], (half_w, height), interpolation=cv2.INTER_LINEAR)
+                full_mask_r = cv2.resize(masks_r[i], (half_w, height), interpolation=cv2.INTER_LINEAR)
+                red_sbs = np.zeros((height, width, 3), dtype=np.uint8)
+                red_sbs[:, :half_w, 2] = full_mask_l
+                red_sbs[:, half_w:, 2] = full_mask_r
+                mask_writer.stdin.write(red_sbs.tobytes())
+            
+        frame_count += chunk_length
+        pbar.update(chunk_length)
+        
+    cap.release()
+    writer.stdin.close()
+    writer.wait()
+    
+    if mask_writer is not None:
+        mask_writer.stdin.close()
+        mask_writer.wait()
+    print("Stereoscopic chunked processing complete!")   
+
 def process_directory(input_dir, output_dir, **kwargs):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -973,6 +965,33 @@ if __name__ == "__main__":
         prompt_text="One girl",
         batch_size=50,
         matte_size=0.4,
-        motion_guided_prompt=True
+        motion_guided_prompt=False
     )
 
+
+    # if apply_temporal_disambiguation:
+    #     model = Sam3VideoInferenceWithInstanceInteractivity(
+    #         detector=detector,
+    #         tracker=tracker,
+    #         score_threshold_detection=0.65,
+    #         assoc_iou_thresh=0.3,
+    #         det_nms_thresh=0.1,
+    #         new_det_thresh=0.99,
+    #         hotstart_delay=8,
+    #         hotstart_unmatch_thresh=5,
+    #         hotstart_dup_thresh=5,
+    #         suppress_unmatched_only_within_hotstart=False,
+    #         min_trk_keep_alive=-1,
+    #         max_trk_keep_alive=100,
+    #         init_trk_keep_alive=5,
+    #         suppress_overlapping_based_on_recent_occlusion_threshold=0.9,
+    #         suppress_det_close_to_boundary=True,
+    #         fill_hole_area=4,
+    #         recondition_every_nth_frame=64,
+    #         masklet_confirmation_enable=True,
+    #         decrease_trk_keep_alive_for_empty_masklets=True,
+    #         image_size=1008,
+    #         image_mean=(0.5, 0.5, 0.5),
+    #         image_std=(0.5, 0.5, 0.5),
+    #         compile_model=compile,
+    #     )
