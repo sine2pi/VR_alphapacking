@@ -965,7 +965,7 @@ if __name__ == "__main__":
         prompt_text="One girl",
         batch_size=50,
         matte_size=0.4,
-        motion_guided_prompt=False
+        motion_guided_prompt=True
     )
 
 
