@@ -491,9 +491,9 @@ def build_tracker(
         multimask_max_pt_num=1,
         # Additional settings
         always_start_from_first_ann_frame=False,
-        # Mask overlap — enforce non-overlapping
-        non_overlap_masks_for_mem_enc=True,
-        non_overlap_masks_for_output=True,
+        # Mask overlap — allow overlapping to prevent cutting holes during self-occlusion
+        non_overlap_masks_for_mem_enc=False,
+        non_overlap_masks_for_output=False,
         max_cond_frames_in_attn=6,
         offload_output_to_cpu_for_eval=False,
         # SAM decoder settings
@@ -763,8 +763,8 @@ def build_sam3_video_model(
             min_trk_keep_alive=-1,
             max_trk_keep_alive=200,
             init_trk_keep_alive=200,
-            # Overlap suppression — aggressive
-            suppress_overlapping_based_on_recent_occlusion_threshold=0.1,
+            # Overlap suppression — relaxed for single target to prevent self-occlusion drops
+            suppress_overlapping_based_on_recent_occlusion_threshold=1.0,
             suppress_det_close_to_boundary=False,
             # Mask quality
             fill_hole_area=16,
