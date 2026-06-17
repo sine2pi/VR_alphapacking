@@ -11,13 +11,13 @@ except ImportError:
     HAS_RAFT = False
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-dtype = torch.float16
+dtype = torch.float32
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def target_shape(img_shape, target_size: int):
     h, w = img_shape[:2]
-    new_w, new_h = (int(target_size * w / h), target_size) if h > w else (target_size, int(target_size * h / w))
-    return new_h, new_w
+    newW, newH = (int(target_size * w / h), target_size) if h > w else (target_size, int(target_size * h / w))
+    return newH, newW
 
 def have(a):
     return a is not None  
@@ -54,7 +54,6 @@ def feather_mask(mask: torch.Tensor, blur_radius: float = 1.5, iterations: int =
 
     for _ in range(iterations):
         x = V.gaussian_blur(x, kernel_size=k_size, sigma=float(blur_radius))
-
     return x.view(orig_shape) 
 
 def morph3x3(mask: torch.Tensor, dilation: int) -> torch.Tensor:
@@ -76,6 +75,7 @@ def mask_edges(mask: torch.Tensor, kernel_size: int = 1) -> torch.Tensor:
     
     orig_shape = mask.shape
     x = mask.float()
+    
     if x.ndim == 2:
         x = x[None, None, ...]
     elif x.ndim == 3:
@@ -88,7 +88,6 @@ def mask_edges(mask: torch.Tensor, kernel_size: int = 1) -> torch.Tensor:
     if pad > 0:
         x = torch.nn.functional.max_pool2d(x, kernel_size=k_size, stride=1, padding=pad)
         x = -torch.nn.functional.max_pool2d(-x, kernel_size=k_size, stride=1, padding=pad)
-        
         x = -torch.nn.functional.max_pool2d(-x, kernel_size=k_size, stride=1, padding=pad)
         x = torch.nn.functional.max_pool2d(x, kernel_size=k_size, stride=1, padding=pad)
     
@@ -98,41 +97,44 @@ def mask_edges(mask: torch.Tensor, kernel_size: int = 1) -> torch.Tensor:
     
     sigma = float(blur_k) / 3.0
     x = V.gaussian_blur(x, kernel_size=blur_k, sigma=sigma)
-    
     x = (x > 0.5).to(mask.dtype)
-    
     return x.view(orig_shape)
 
 def apply_effects(masks, dilation, feather_radius, smooth_edges):
     out_masks = []
     for m in masks:
-        t = torch.from_numpy(m).to(device).float() / 255.0
+        if isinstance(m, np.ndarray):
+            mask = torch.from_numpy(m).to(device).float() / 255.0
         if dilation != 0:
-            t = morph3x3(t, dilation)
+            if dilation > 0:
+                mask = morph3x3(mask, dilation)
+            else:
+                mask = morph3x3(mask, dilation)
         if smooth_edges > 0:
-            t = mask_edges(t, kernel_size=smooth_edges)
+            mask = mask_edges(mask, kernel_size=smooth_edges)
         if feather_radius > 0:
-            t = feather_mask(t, blur_radius=feather_radius)
-        out_masks.append((t.cpu().numpy() * 255).astype(np.uint8))
+            mask = feather_mask(mask, blur_radius=feather_radius)
+        out_masks.append((mask.cpu().numpy() * 255).astype(np.uint8))
     return out_masks
 
-def metadata(path):
-    cmd_key = [
-        'ffprobe', '-v', 'error', '-select_streams', 'v:0',
-        '-show_entries', 'frame=pict_type',
-        '-of', 'csv=p=0', '-skip_frame', 'nokey', path]
+def denormalize_and_resize(tensor, target_w, target_h):
+    if isinstance(tensor, np.ndarray):
+        tensor = torch.from_numpy(tensor).to(device)
+    img_float = (tensor.float() * 0.5 + 0.5) * 255.0
+    if img_float.shape[2] != target_w or img_float.shape[1] != target_h:
+        img_float = torch.nn.functional.interpolate(img_float.unsqueeze(0), size=(target_h, target_w), mode="bicubic", align_corners=False).squeeze(0)
+    img = img_float.permute(1, 2, 0).to(torch.uint8)
+    return img
 
+def metadata(path):
+    cmd_key = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'frame=pict_type', '-of', 'csv=p=0', '-skip_frame', 'nokey', path]
     res_key = subprocess.run(cmd_key, capture_output=True, text=True)
     lines = res_key.stdout.strip().split('\n')
     num_keyframes = len(lines)
-
-    cmd_stream = [
-        'ffprobe', '-v', 'quiet', '-print_format', 'json', 
-        '-show_streams', '-select_streams', 'v:0', path]
-
+    cmd_stream = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', '-select_streams', 'v:0', path]
     res_stream = subprocess.run(cmd_stream, capture_output=True, text=True)
     data = json.loads(res_stream.stdout)
-    
+
     if not data.get('streams'):
         return None, None, None, None, None, None
         
@@ -140,15 +142,11 @@ def metadata(path):
     width = int(stream['width'])
     height = int(stream['height'])
     duration = float(stream.get('duration', 0))
-        
     fps_str = stream.get('r_frame_rate', '30/1')
-    try:
-        num, denom = map(int, fps_str.split('/'))
-        fps = num / denom if denom != 0 else 30.0
-    except:
-        fps = 30.0
-
+    num, denom = map(int, fps_str.split('/'))
+    fps = num / denom if denom != 0 else 30.0
     f_tot = stream.get('nb_frames')
+
     if f_tot:
         nb_frames = int(f_tot)
     else:
@@ -167,7 +165,7 @@ def ffmpeg_pipe(out_path, width, height, fps):
     return subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 class Raft:
-    def __init__(self, device=None, max_size=256, flow_scale=1.0, interp_mode="bicubic"):
+    def __init__(self, device, max_size=1024, flow_scale=1.0, interp_mode="bicubic"):
         self.device = torch.device(device) if isinstance(device, str) else (device or torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
         self.max_size = max_size
         self.flow_scale = flow_scale
@@ -176,92 +174,60 @@ class Raft:
         self.model = raft_small(weights=self.weights, progress=False).to(self.device).eval()
         self.transforms = self.weights.transforms()     
  
-    def compute_raft_flow(self, img1, img2, max_size=256, scale_factor=1.0, interp_mode="bilinear", target_size=None):
-        orig_H, orig_W =  V.get_image_size(img1)
+    def compute_raft_flow(self, img1a, img2a, max_size, scale, interp_mode, target_size):
 
-        current_H, current_W = orig_H * scale_factor, orig_W * scale_factor 
+        origH, origW =  V.get_image_size(img1a)
+        current_H, current_W = origH * scale, origW * scale 
 
         if max(current_H, current_W) > max_size:
-            scale_factor = scale_factor * (max_size / float(max(current_H, current_W)))
+            scale = scale * (max_size / float(max(current_H, current_W)))
 
-        if scale_factor != 1.0:
-            new_H, new_W = int(orig_H * scale_factor), int(orig_W * scale_factor)
-            img1_s = F.interpolate(img1, size=(new_H, new_W), mode=interp_mode, antialias=True)
-            img2_s = F.interpolate(img2, size=(new_H, new_W), mode=interp_mode, antialias=True)
+        if scale != 1.0:
+            newH, newW = int(origH * scale), int(origW * scale)
+            img1b = F.interpolate(img1a, size=(newH, newW), mode=interp_mode, antialias=True)
+            img2b = F.interpolate(img2a, size=(newH, newW), mode=interp_mode, antialias=True)
         else:
-            new_H, new_W = orig_H, orig_W
-            img1_s, img2_s = img1, img2
+            newH, newW = origH, origW
+            img1b, img2b = img1a, img2a
 
-        img1_t, img2_t = self.transforms(img1_s, img2_s)
-        _, _, H_s, W_s = img1_t.shape
-        pad_h, pad_w = (8 - H_s % 8) % 8, (8 - W_s % 8) % 8
+        img1c, img2c = self.transforms(img1b, img2b)
+        _, _, H_s, W_s = img1c.shape
+        padh, padw = (8 - H_s % 8) % 8, (8 - W_s % 8) % 8
 
-        if pad_h > 0 or pad_w > 0:
-            img1_t = F.pad(img1_t, (0, pad_w, 0, pad_h))
-            img2_t = F.pad(img2_t, (0, pad_w, 0, pad_h))
+        if padh > 0 or padw > 0:
+            img1c = F.pad(img1c, (0, padw, 0, padh))
+            img2c = F.pad(img2c, (0, padw, 0, padh))
 
-        with torch.inference_mode(), torch.autocast(device_type=self.device.type, dtype=torch.float16 if self.device.type == 'cuda' else torch.float32):
+        flow = self.model(img1c, img2c)[-1].float()
+        if padh > 0 or padw > 0:
+            flow = flow[:, :, :H_s, :W_s]
 
-            flow = self.model(img1_t, img2_t)[-1].float()
-            flow = torch.nan_to_num(flow, nan=0.0, posinf=0.0, neginf=0.0)
-            if pad_h > 0 or pad_w > 0:
-                flow = flow[:, :, :H_s, :W_s]
-
-            out_H, out_W = target_size if target_size else (orig_H, orig_W)
-            if out_H != H_s or out_W != W_s:
-                flow = F.interpolate(flow, size=(out_H, out_W), mode=interp_mode)
-                flow[:, 0] *= (out_W / W_s)
-                flow[:, 1] *= (out_H / H_s)
+        out_H, out_W = target_size if target_size else (origH, origW)
+        if out_H != H_s or out_W != W_s:
+            flow = F.interpolate(flow, size=(out_H, out_W), mode=interp_mode, antialias=True)
+            flow[:, 0] *= (out_W / W_s)
+            flow[:, 1] *= (out_H / H_s)
                 
         return flow
 
-    def warp_frame(self, pt_frame, flow, t=1.0, max_size=256, scale_factor=0.5, interp_mode="bilinear"):
+    def warp_frame(self, a, b, scale=1.0, interp_mode="bicubic", N=None):
+        C, H, W = a.shape if a.ndim != 4 else (N, C, H, W)
+        scaled = b * scale
+        y, x = torch.meshgrid(torch.arange(H, device=self.device), torch.arange(W, device=self.device), indexing='ij')
+        x_norm = 2.0 * (x + scaled[0]) / max(W - 1, 1) - 1.0
+        y_norm = 2.0 * (y + scaled[1]) / max(H - 1, 1) - 1.0
+        grid = torch.stack((x_norm, y_norm), dim=-1).unsqueeze(0)
+        grid = grid.expand(N, -1, -1, -1) if have(N) else grid
+        return F.grid_sample(a, grid, mode=interp_mode, padding_mode='border', align_corners=True) if have(N) else F.grid_sample(a.unsqueeze(0), grid, mode=interp_mode, padding_mode='border', align_corners=True).squeeze(0)
 
-        if pt_frame.ndim == 3:
-            C, H, W = pt_frame.shape
-            scale_factord = flow * t
-            y, x = torch.meshgrid(torch.arange(H, device=self.device), torch.arange(W, device=self.device), indexing='ij')
-            x_norm = 2.0 * (x + scale_factord[0]) / max(W - 1, 1) - 1.0
-            y_norm = 2.0 * (y + scale_factord[1]) / max(H - 1, 1) - 1.0
-            grid = torch.stack((x_norm, y_norm), dim=-1).unsqueeze(0)
-            align_corners = True if interp_mode != 'nearest' else None
+class AlphaPacker:
+    def __init__(self, scale=0.40, padding=0):
 
-            if align_corners is None:
-                return F.grid_sample(pt_frame.unsqueeze(0), grid, mode=interp_mode, padding_mode='border').squeeze(0)
-            else:
-                return F.grid_sample(pt_frame.unsqueeze(0), grid, mode=interp_mode, padding_mode='border', align_corners=align_corners).squeeze(0)
-
-        elif pt_frame.ndim == 4:
-            N, C, H, W = pt_frame.shape
-            scale_factord = flow * t
-            y, x = torch.meshgrid(torch.arange(H, device=self.device), torch.arange(W, device=self.device), indexing='ij')
-            x_norm = 2.0 * (x + scale_factord[0]) / max(W - 1, 1) - 1.0
-            y_norm = 2.0 * (y + scale_factord[1]) / max(H - 1, 1) - 1.0
-            grid = torch.stack((x_norm, y_norm), dim=-1).unsqueeze(0)
-            grid = grid.expand(N, -1, -1, -1)
-            align_corners = True if interp_mode != 'nearest' else None
-
-            if align_corners is None:
-                return F.grid_sample(pt_frame, grid, mode=interp_mode, padding_mode='border')
-            else:
-                return F.grid_sample(pt_frame, grid, mode=interp_mode, padding_mode='border', align_corners=align_corners)
-        else:
-            raise ValueError(f"Unexpected pt_frame dimensions: {pt_frame.ndim}")
-
-class AlphaCornerPacker:
-    def __init__(self, scale_factor=0.40, padding=0):
-
-        self.scale = scale_factor
+        self.scale = scale
         self.padding = padding
         self.vignette_cache = None
 
     def pack_frame(self, sbs_rgb, mask_l, mask_r):
-
-        dilation = 0
-        feather = 1
-        smooth = 1
-        fcolor = (0, 0, 255)  
-        bcolor = (0, 0, 0)
 
         H, SBS_W, C = sbs_rgb.shape
         W = SBS_W // 2
@@ -287,7 +253,6 @@ class AlphaCornerPacker:
         mask_r_vignette = r_small.astype(np.uint8) 
 
         packed_frame = sbs_rgb
-
         h_half = target_h // 2
         top_half_mask = mask_l_vignette[:h_half, :]
         bottom_half_mask = mask_l_vignette[h_half:h_half*2, :]
@@ -301,7 +266,7 @@ class AlphaCornerPacker:
         def blend_red_mask(roi, mask_1ch):
             inv_mask_3d = (255 - mask_1ch)[..., np.newaxis]
             blended = (roi.astype(np.uint16) * inv_mask_3d) // 255
-            blended[..., 2] += mask_1ch  # BGR: channel 2 is Red
+            blended[..., 2] += mask_1ch
             return blended.astype(np.uint8)
 
         y1_top = self.padding
@@ -310,7 +275,6 @@ class AlphaCornerPacker:
         x2_mid = x1_mid + target_w
         
         packed_frame[y1_top:y2_top, x1_mid:x2_mid] = blend_red_mask(packed_frame[y1_top:y2_top, x1_mid:x2_mid], bottom_half_mask)
-
         y1_bot = H - self.padding - h_half
         y2_bot = y1_bot + h_half
         packed_frame[y1_bot:y2_bot, x1_mid:x2_mid] = blend_red_mask(packed_frame[y1_bot:y2_bot, x1_mid:x2_mid], top_half_mask)
@@ -337,55 +301,45 @@ class AlphaCornerPacker:
         y2_bl_l = y1_bl_l + h_half
         x1_bl_l = self.padding
         x2_bl_l = self.padding + w_half
-        packed_frame[y1_bl_l:y2_bl_l, x1_bl_l:x2_bl_l] = blend_red_mask(
-            packed_frame[y1_bl_l:y2_bl_l, x1_bl_l:x2_bl_l], q_tr_mask
-        )
-
+        packed_frame[y1_bl_l:y2_bl_l, x1_bl_l:x2_bl_l] = blend_red_mask(packed_frame[y1_bl_l:y2_bl_l, x1_bl_l:x2_bl_l], q_tr_mask)
         return packed_frame
 
-def process_batch(predictor, raft, frames_pil, frames_bgr, prompt_text=None, bbox=None, prior_mask=None):
+def process_frames(predictor, raft, frames_pil, frames_bgr, prompt_text=None, bbox=None, prior_mask=None, warp=True):
 
-    height, width = frames_bgr[0].shape[:2]
     chunk = len(frames_pil)
-
-    res_inline = predictor.handle_request(dict(
+    height, width = frames_bgr[0].shape[:2]
+    res = predictor.handle_request(dict(
         type="start_session",
         resource_path=frames_pil))
 
-    sid_inline = res_inline["session_id"]
+    sid = res["session_id"]
     if prior_mask is not None:
         predictor.handle_request(dict(
             type="add_new_mask",
-            session_id=sid_inline,
+            session_id=sid,
             frame_index=0,
             obj_id=0,
-            mask=prior_mask
-            ))
+            mask=prior_mask))
  
-    prompt_req_inline = dict(type="add_prompt", session_id=sid_inline, frame_index=0, obj_id=0)
+    prompt_req = dict(type="add_prompt", session_id=sid, frame_index=0, obj_id=0)
 
-    if prompt_text is not None:
-        prompt_req_inline["text"] = prompt_text
-        
-    elif bbox is not None:
-        prompt_req_inline["bounding_boxes"] = [bbox]
-        prompt_req_inline["bounding_box_labels"] = [1]
-    else:
-        prompt_req_inline["points"] = [[width // 2, height // 2]]
-        prompt_req_inline["point_labels"] = [1]
+    prompt_req["text"] = prompt_text
+    if bbox is not None:
+        prompt_req["bounding_boxes"] = [bbox]
+        prompt_req["bounding_box_labels"] = [[1]]
 
-    predictor.handle_request(prompt_req_inline)
-    session_inline = predictor._get_session(sid_inline)
-    inference_state = session_inline["state"]
-    tracker_states = inference_state["tracker_inference_states"]
+    predictor.handle_request(prompt_req)
+    session = predictor._get_session(sid)
+    inference_state = session["state"]
+    states = inference_state["tracker_inference_states"]
 
-    if len(tracker_states) == 0:
-        print(f"[WARNING] Prompt '{prompt_text}' found no objects in this chunk. Generating empty masks.")
-        predictor.handle_request(dict(type="close_session", session_id=sid_inline))
+    if len(states) == 0:
+        print(f"[GASP!] OH NO! Prompt '{prompt_text}' found no chunky objects..")
+        predictor.handle_request(dict(type="close_session", session_id=sid))
         empty = [np.zeros((height, width), dtype=np.uint8) for _ in range(chunk)]
         return empty, empty
 
-    tracker_state = tracker_states[0]
+    state = states[0]
     tensors_rgb = []
 
     for f_bgr in frames_bgr:
@@ -393,42 +347,42 @@ def process_batch(predictor, raft, frames_pil, frames_bgr, prompt_text=None, bbo
         t_rgb = torch.from_numpy(f_rgb).permute(2, 0, 1).float().div(255.0).to(device)
         tensors_rgb.append(t_rgb)
 
-    prev_logits = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].to(device).float()
-    batch_size = len(tracker_state["obj_ids"])
-    predictor.model.tracker.propagate_in_video_preflight(tracker_state, run_mem_encoder=True)
+    prev_logits = state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].to(device).float()
+    batch_size = len(state["obj_ids"])
+    predictor.model.tracker.propagate_in_video_preflight(state, run_mem_encoder=True)
 
-    with torch.inference_mode():
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         for frame_idx in range(1, chunk):
             prev_tensor = tensors_rgb[frame_idx - 1]
             curr_tensor = tensors_rgb[frame_idx]
-            
+
             predictor.model._prepare_backbone_feats(
                 inference_state=inference_state,
                 frame_idx=frame_idx,
-                reverse=False
-            )
-    
-            _, _, h_mask, w_mask = prev_logits.shape
+                reverse=False)
 
-            flow_downscaled = raft.compute_raft_flow(
-                prev_tensor.unsqueeze(0), 
-                curr_tensor.unsqueeze(0), 
-                max_size=int(max(h_mask, w_mask)),
-                scale_factor=1.0,
-                interp_mode="bilinear",
-                target_size=(h_mask, w_mask)
-            ).squeeze(0)
-            
-            warped_logits = raft.warp_frame(prev_logits.squeeze(0), flow_downscaled).unsqueeze(0)
-            
+            _, _, h_mask, w_mask = prev_logits.shape
+            if warp:
+                _, _, frame_H, frame_W = prev_tensor.unsqueeze(0).shape
+                flow = raft.compute_raft_flow(
+                    prev_tensor.unsqueeze(0),
+                    curr_tensor.unsqueeze(0),
+                    max_size=max(frame_H, frame_W),
+                    scale=1.0,
+                    interp_mode="bicubic",
+                    target_size=(h_mask, w_mask)).squeeze(0)
+                warped_logits = raft.warp_frame(prev_logits.squeeze(0), flow).unsqueeze(0)
+            else:
+                warped_logits = prev_logits
+
             dummy_point_inputs = {
                 "point_coords": torch.zeros(1, 1, 2, device=device),
                 "point_labels": -torch.ones(1, 1, dtype=torch.int32, device=device)
             }
-            
+
             current_out, _ = predictor.model.tracker._run_single_frame_inference(
-                inference_state=tracker_state,
-                output_dict=tracker_state["output_dict"],
+                inference_state=state,
+                output_dict=state["output_dict"],
                 frame_idx=frame_idx,
                 batch_size=1,
                 is_init_cond_frame=False,
@@ -438,22 +392,27 @@ def process_batch(predictor, raft, frames_pil, frames_bgr, prompt_text=None, bbo
                 run_mem_encoder=True,
                 prev_sam_mask_logits=warped_logits,
             )
-            
+
             if current_out["pred_masks"].max() < 0.0:
-                current_out["pred_masks"] = warped_logits
+                print(f'No Mask!', frame_idx)
+                if warped_logits.max() > 0.0:
+                    current_out["pred_masks"] = warped_logits
+                else:
+                    current_out["pred_masks"] = prev_logits
                 if "pred_masks_high_res" in current_out:
                     del current_out["pred_masks_high_res"]
 
-            tracker_state["output_dict"]["non_cond_frame_outputs"][frame_idx] = current_out
-            predictor.model.tracker._add_output_per_object(tracker_state, frame_idx, current_out, "non_cond_frame_outputs")
-            tracker_state["frames_already_tracked"][frame_idx] = {"reverse": False}
+            state["output_dict"]["non_cond_frame_outputs"][frame_idx] = current_out
+            predictor.model.tracker._add_output_per_object(state, frame_idx, current_out, "non_cond_frame_outputs")
+            state["frames_already_tracked"][frame_idx] = {"reverse": False}
             prev_logits = current_out["pred_masks"].to(device).float()
 
-    final_masks = []
+    hard_masks = []
+    soft_masks = []
 
     for i in range(chunk):
         storage_key = "cond_frame_outputs" if i == 0 else "non_cond_frame_outputs"
-        out = tracker_state["output_dict"][storage_key][i]
+        out = state["output_dict"][storage_key][i]
         logits_gpu = out["pred_masks_high_res"].to(device) if "pred_masks_high_res" in out else out["pred_masks"].to(device)
 
         if logits_gpu.shape[0] > 0:
@@ -464,23 +423,47 @@ def process_batch(predictor, raft, frames_pil, frames_bgr, prompt_text=None, bbo
         logits_resized = torch.nn.functional.interpolate(
             logits_gpu,
             size=(height, width),
-            mode="bilinear",
+            mode="bicubic",
             align_corners=False).squeeze(0).squeeze(0)
         
         prob = torch.sigmoid(logits_resized)
-        final_masks.append(((prob > 0.5) * 255).to(torch.uint8).cpu().numpy())
+        soft_masks.append(prob)
+        hard_masks.append(((prob > 0.5) * 255).to(torch.uint8).cpu().numpy())
 
-    predictor.handle_request(dict(type="close_session", session_id=sid_inline))
-    return final_masks
+    hard_masks = [m.copy() for m in hard_masks]
+    valid_idx = [i for i, m in enumerate(hard_masks) if np.sum(m) > 0]
+    
+    if 0 < len(valid_idx) < chunk:
+        for i in range(chunk):
+            if np.sum(hard_masks[i]) == 0:
+                print(f'No Mask!', i)
+                prev_i = next((j for j in reversed(valid_idx) if j < i), None)
+                next_i = next((j for j in valid_idx if j > i), None)
+                if prev_i is not None and next_i is not None:
+                    dist_prev = i - prev_i
+                    dist_next = next_i - i
+                    w_prev = dist_next / (dist_prev + dist_next)
+                    w_next = dist_prev / (dist_prev + dist_next)
+                    blended = (hard_masks[prev_i].astype(np.float32) * w_prev + 
+                               hard_masks[next_i].astype(np.float32) * w_next)
+                    hard_masks[i] = (blended > 127).astype(np.uint8) * 255
+                elif prev_i is not None:
+                    hard_masks[i] = hard_masks[prev_i] 
+                elif next_i is not None:
+                    hard_masks[i] = hard_masks[next_i] 
+
+    predictor.handle_request(dict(type="close_session", session_id=sid))
+    return hard_masks, soft_masks
 
 def process_videos(
-    video_path, out_path, out_mask_path=None,
-    left_bbox=None, right_bbox=None,
+    video_path,
+    out_path,
+    out_mask_path=None,
     prompt_text=None,
     batch_size=100,
     matte_size=0.4,
-    motion_guided_prompt=True
-):
+    warp=True,
+):  
 
     predictor = build_sam3_video_predictor(
         has_presence_token=False,
@@ -494,16 +477,15 @@ def process_videos(
     )
 
     raft =  Raft(device="cuda")
-
     total_frames, num_keyframes, width, height, duration, fps = metadata(video_path)
     cap = cv2.VideoCapture(video_path)
-    writer = ffmpeg_pipe(out_path, width, height, fps)
+    writer = ffmpeg_pipe(out_path, width, height, fps) if out_path else None
     mask_writer = ffmpeg_pipe(out_mask_path, width, height, fps) if out_mask_path else None
     half_w = width // 2
-    packer = AlphaCornerPacker(scale_factor=matte_size)
+    packer = AlphaPacker(scale=matte_size)
 
     frame_count = 0
-    pbar = tqdm(total=total_frames, desc="Processing SBS Batches")
+    pbar = tqdm(total=total_frames, desc="Processing .. beep.boop.bop.. beep.")
 
     last_mask_l = None
     last_mask_r = None
@@ -517,89 +499,66 @@ def process_videos(
             
         if not frames_bgr:
             break
-            
-        chunk_length = len(frames_bgr)
-        frames_l_bgr = [f[:, :half_w] for f in frames_bgr]
-        frames_r_bgr = [f[:, half_w:] for f in frames_bgr]
+        chunk = len(frames_bgr)
+        frames_l = [f[:, :half_w] for f in frames_bgr]
+        frames_r = [f[:, half_w:] for f in frames_bgr]
 
-        target_w = int(half_w * matte_size)
-        target_h = int(height * matte_size)
-        
-        frames_l_bgr_small = [cv2.resize(f, (target_w, target_h), interpolation=cv2.INTER_AREA) for f in frames_l_bgr]
-        frames_r_bgr_small = [cv2.resize(f, (target_w, target_h), interpolation=cv2.INTER_AREA) for f in frames_r_bgr]
-        
-        left_bbox_small = [
-            left_bbox[0] * matte_size,
-            left_bbox[1] * matte_size,
-            left_bbox[2] * matte_size,
-            left_bbox[3] * matte_size
-        ] if left_bbox is not None else None
-        
-        right_bbox_small = [
-            right_bbox[0] * matte_size,
-            right_bbox[1] * matte_size,
-            right_bbox[2] * matte_size,
-            right_bbox[3] * matte_size
-        ] if right_bbox is not None else None
-        
+        sam_w = 1024
+        sam_h = 1024
+        l_small = [cv2.resize(f, (sam_w, sam_h), interpolation=cv2.INTER_AREA) for f in frames_l]
+        r_small = [cv2.resize(f, (sam_w, sam_h), interpolation=cv2.INTER_AREA) for f in frames_r]
+
         prior_l = last_mask_l if (last_mask_l is not None and np.sum(last_mask_l) > 0) else None
-        eye_frames_pil_l = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_l_bgr_small]
+        pil_l = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in l_small]
 
-        masks_l = process_batch(
+        masks_l, soft_l = process_frames(
             predictor=predictor,
             raft=raft,
-            frames_pil=eye_frames_pil_l,
-            frames_bgr=frames_l_bgr_small,
+            frames_pil=pil_l,
+            frames_bgr=l_small,
             prompt_text=prompt_text,
-            bbox=left_bbox_small,
-            prior_mask=prior_l
-        )
-        torch.cuda.empty_cache()
+     
+            prior_mask=prior_l,
+            warp=warp)
 
         prior_r = last_mask_r if (last_mask_r is not None and np.sum(last_mask_r) > 0) else None
-        pil_r = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_r_bgr_small]
-        
-        masks_r = process_batch(
+        pil_r = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in r_small]
+
+        masks_r, soft_r = process_frames(
             predictor=predictor,
             raft=raft,
             frames_pil=pil_r,
-            frames_bgr=frames_r_bgr_small,
+            frames_bgr=r_small,
             prompt_text=prompt_text,
-            bbox=right_bbox_small,
-            prior_mask=prior_r
-        )
-        torch.cuda.empty_cache()
+    
+            prior_mask=prior_r,
+            warp=warp)
+
+        masks_l = apply_effects(masks_l, dilation=0, feather_radius=1, smooth_edges=1)
+        masks_r = apply_effects(masks_r, dilation=0, feather_radius=1, smooth_edges=1)
 
         last_mask_l = masks_l[-1]
         last_mask_r = masks_r[-1]
 
-        masks_l = apply_effects(masks_l, dilation=0, feather_radius=0.5, smooth_edges=1)
-        masks_r = apply_effects(masks_r, dilation=0, feather_radius=0.5, smooth_edges=1)
-
-        for i in range(chunk_length):
-            packed_frame = packer.pack_frame(frames_bgr[i], masks_l[i],masks_r[i])
+        for i in range(chunk):
+            packed_frame = packer.pack_frame(frames_bgr[i], masks_l[i], masks_r[i])
             writer.stdin.write(packed_frame.astype(np.uint8).tobytes())
-            
-            if mask_writer is not None:
-                full_mask_l = cv2.resize(masks_l[i], (half_w, height), interpolation=cv2.INTER_LINEAR)
-                full_mask_r = cv2.resize(masks_r[i], (half_w, height), interpolation=cv2.INTER_LINEAR)
-                red_sbs = np.zeros((height, width, 3), dtype=np.uint8)
-                red_sbs[:, :half_w, 2] = full_mask_l
-                red_sbs[:, half_w:, 2] = full_mask_r
-                mask_writer.stdin.write(red_sbs.tobytes())
-            
-        frame_count += chunk_length
-        pbar.update(chunk_length)
+            full_mask_l = cv2.resize(masks_l[i], (half_w, height), interpolation=cv2.INTER_LINEAR)
+            full_mask_r = cv2.resize(masks_r[i], (half_w, height), interpolation=cv2.INTER_LINEAR)
+            red_sbs = np.zeros((height, width, 3), dtype=np.uint8)
+            red_sbs[:, :half_w, 2] = full_mask_l
+            red_sbs[:, half_w:, 2] = full_mask_r
+            mask_writer.stdin.write(red_sbs.tobytes())
+
+        frame_count += chunk
+        pbar.update(chunk)
         
     cap.release()
     writer.stdin.close()
     writer.wait()
-    
-    if mask_writer is not None:
-        mask_writer.stdin.close()
-        mask_writer.wait()
-    print("Stereoscopic chunked processing complete!")   
-
+    mask_writer.stdin.close()
+    mask_writer.wait()
+        
 def process_directory(input_dir, output_dir, **kwargs):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -651,5 +610,5 @@ if __name__ == "__main__":
         prompt_text="One girl",
         batch_size=100,
         matte_size=0.4,
-        motion_guided_prompt=True
     )
+
