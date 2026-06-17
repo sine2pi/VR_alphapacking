@@ -662,12 +662,20 @@ def build_sam3_image_model(
 
     return model
 
+# def download_ckpt_from_hf():
+#     SAM3_MODEL_ID = "mlx-community/sam3-bf16"
+#     SAM3_CKPT_NAME = "model.safetensors"
+#     SAM3_CFG_NAME = "config.json"
+#     _ = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CFG_NAME)
+#     checkpoint_path = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CKPT_NAME)
+#     return checkpoint_path
+
 def download_ckpt_from_hf():
     SAM3_MODEL_ID = "Translsis/sam3-model"
     SAM3_CKPT_NAME = "sam3.pt"
     SAM3_CFG_NAME = "config.json"
-    _ = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CFG_NAME, force_download=False, local_files_only=False)
-    checkpoint_path = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CKPT_NAME, force_download=False, local_files_only=False)
+    _ = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CFG_NAME, force_download=False, local_files_only=True)
+    checkpoint_path = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CKPT_NAME, force_download=False, local_files_only=True)
     return checkpoint_path
 
 def build_sam3_video_model(
@@ -742,7 +750,7 @@ def build_sam3_video_model(
             tracker=tracker,
             # Detection gate — only high-confidence detections pass
             score_threshold_detection=0.75,
-            det_nms_thresh=0.7,
+            det_nms_thresh=0.5,
             new_det_thresh=1.01,              # >1.0 = impossible to spawn new tracks after frame 0
             # Association — generous matching for stationary target
             assoc_iou_thresh=0.15,
@@ -756,13 +764,13 @@ def build_sam3_video_model(
             max_trk_keep_alive=200,
             init_trk_keep_alive=200,
             # Overlap suppression — aggressive
-            suppress_overlapping_based_on_recent_occlusion_threshold=0.5,
-            suppress_det_close_to_boundary=True,
+            suppress_overlapping_based_on_recent_occlusion_threshold=0.1,
+            suppress_det_close_to_boundary=False,
             # Mask quality
-            fill_hole_area=8,
-            recondition_every_nth_frame=32,
+            fill_hole_area=16,
+            recondition_every_nth_frame=16,
             masklet_confirmation_enable=False,
-            decrease_trk_keep_alive_for_empty_masklets=False,
+            decrease_trk_keep_alive_for_empty_masklets=True,
             image_size=1008,
             image_mean=(0.5, 0.5, 0.5),
             image_std=(0.5, 0.5, 0.5),
