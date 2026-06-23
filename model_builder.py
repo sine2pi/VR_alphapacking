@@ -1,5 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
-
 import os
 from typing import Optional
 
@@ -426,21 +424,21 @@ def build_tracker(
         backbone_stride=14,
         transformer=transformer,
         maskmem_backbone=maskmem_backbone,
-        # SAM parameters
-        multimask_output_in_sam=False,
+        # SAM parameters — single mask for deterministic output
+        multimask_output_in_sam=True,
         # Evaluation
         forward_backbone_per_frame_for_eval=True,
         trim_past_non_cond_mem_for_eval=False,
-        # Multimask
-        multimask_output_for_tracking=False,
+        # Multimask — disabled for single unambiguous target
+        multimask_output_for_tracking=True,
         multimask_min_pt_num=0,
         multimask_max_pt_num=1,
         # Additional settings
-        always_start_from_first_ann_frame=True,
-        # Mask overlap
-        non_overlap_masks_for_mem_enc=True,
+        always_start_from_first_ann_frame=False,
+        # Mask overlap — enforce non-overlapping
+        non_overlap_masks_for_mem_enc=False,
         non_overlap_masks_for_output=False,
-        max_cond_frames_in_attn=6,
+        max_cond_frames_in_attn=4,
         offload_output_to_cpu_for_eval=False,
         # SAM decoder settings
         sam_mask_decoder_extra_args={
@@ -449,65 +447,11 @@ def build_tracker(
             "dynamic_multimask_stability_thresh": 0.98,
         },
         clear_non_cond_mem_around_input=True,
-        fill_hole_area=16,
+        fill_hole_area=0,
         use_memory_selection=apply_temporal_disambiguation,
     )
 
     return model
-
-# def build_tracker(
-#     apply_temporal_disambiguation: bool, with_backbone: bool = False, compile_mode=None
-# ) -> Sam3TrackerPredictor:
-#     """
-#     Build the SAM3 Tracker module for video tracking.
-
-#     Returns:
-#         Sam3TrackerPredictor: Wrapped SAM3 Tracker module
-#     """
-
-#     # Create model components
-#     maskmem_backbone = _create_tracker_maskmem_backbone()
-#     transformer = _create_tracker_transformer()
-#     backbone = None
-#     if with_backbone:
-#         vision_backbone = _create_vision_backbone(compile_mode=compile_mode)
-#         backbone = SAM3VLBackbone(scalp=1, visual=vision_backbone, text=None)
-#     # Create the Tracker module
-#     model = Sam3TrackerPredictor(
-#         image_size=1008,
-#         num_maskmem=7,
-#         backbone=backbone,
-#         backbone_stride=14,
-#         transformer=transformer,
-#         maskmem_backbone=maskmem_backbone,
-#         # SAM parameters — single mask for deterministic output
-#         multimask_output_in_sam=False,
-#         # Evaluation
-#         forward_backbone_per_frame_for_eval=True,
-#         trim_past_non_cond_mem_for_eval=False,
-#         # Multimask — disabled for single unambiguous target
-#         multimask_output_for_tracking=False,
-#         multimask_min_pt_num=0,
-#         multimask_max_pt_num=1,
-#         # Additional settings
-#         always_start_from_first_ann_frame=False,
-#         # Mask overlap — allow overlapping to prevent cutting holes during self-occlusion
-#         non_overlap_masks_for_mem_enc=False,
-#         non_overlap_masks_for_output=False,
-#         max_cond_frames_in_attn=6,
-#         offload_output_to_cpu_for_eval=False,
-#         # SAM decoder settings
-#         sam_mask_decoder_extra_args={
-#             "dynamic_multimask_via_stability": True,
-#             "dynamic_multimask_stability_delta": 0.05,
-#             "dynamic_multimask_stability_thresh": 0.98,
-#         },
-#         clear_non_cond_mem_around_input=True,
-#         fill_hole_area=8,
-#         use_memory_selection=apply_temporal_disambiguation,
-#     )
-
-#     return model
 
 def _create_text_encoder(bpe_path: str) -> VETextEncoder:
     """Create SAM3 text encoder."""
@@ -743,66 +687,67 @@ def build_sam3_video_model(
         supervise_joint_box_scores=has_presence_token,
     )
 
-    # # Build the main SAM3 video model
+    # Build the main SAM3 video model
+    if apply_temporal_disambiguation:
+        model = Sam3VideoInferenceWithInstanceInteractivity(
+            detector=detector,
+            tracker=tracker,
+            # Detection gate — relaxed to catch motion blur
+            score_threshold_detection=0.55,
+            det_nms_thresh=0.1,
+            # CRITICAL: > 1.0 explicitly disables SAM3 from spontaneously spawning new tracking instances
+            new_det_thresh=2.0,              
+            # Association — extremely generous matching for fast limb movement
+            assoc_iou_thresh=0.1,
+            # Hotstart — kill accidental tracks immediately
+            hotstart_delay=8,
+            hotstart_unmatch_thresh=5,
+            hotstart_dup_thresh=5,
+            suppress_unmatched_only_within_hotstart=False,
+            # Keep-alive — primary track survives indefinitely
+            min_trk_keep_alive=-1,
+            max_trk_keep_alive=200,
+            init_trk_keep_alive=10,
+            # Overlap suppression — relaxed (0.9) to prevent self-occluding arms/legs from deleting the mask
+            suppress_overlapping_based_on_recent_occlusion_threshold=0.5,
+            suppress_det_close_to_boundary=True,
+            # Mask quality
+            fill_hole_area=8,
+            recondition_every_nth_frame=16,
+            masklet_confirmation_enable=False,
+            decrease_trk_keep_alive_for_empty_masklets=False,
+            image_size=1008,
+            image_mean=(0.5, 0.5, 0.5),
+            image_std=(0.5, 0.5, 0.5),
+            compile_model=compile,
+        )
+
     # if apply_temporal_disambiguation:
     #     model = Sam3VideoInferenceWithInstanceInteractivity(
     #         detector=detector,
     #         tracker=tracker,
-    #         # Detection gate — only high-confidence detections pass
-    #         score_threshold_detection=0.75,
-    #         det_nms_thresh=0.5,
-    #         new_det_thresh=1.01,              # >1.0 = impossible to spawn new tracks after frame 0
-    #         # Association — generous matching for stationary target
-    #         assoc_iou_thresh=0.15,
-    #         # Hotstart — kill accidental tracks immediately
-    #         hotstart_delay=3,
-    #         hotstart_unmatch_thresh=1,
-    #         hotstart_dup_thresh=1,
+    #         score_threshold_detection=0.65,
+    #         assoc_iou_thresh=0.3,
+    #         det_nms_thresh=0.1,
+    #         new_det_thresh=0.99,
+    #         hotstart_delay=8,
+    #         hotstart_unmatch_thresh=5,
+    #         hotstart_dup_thresh=5,
     #         suppress_unmatched_only_within_hotstart=False,
-    #         # Keep-alive — primary track survives indefinitely
     #         min_trk_keep_alive=-1,
-    #         max_trk_keep_alive=200,
-    #         init_trk_keep_alive=200,
-    #         # Overlap suppression — relaxed for single target to prevent self-occlusion drops
-    #         suppress_overlapping_based_on_recent_occlusion_threshold=1.0,
-    #         suppress_det_close_to_boundary=False,
-    #         # Mask quality
-    #         fill_hole_area=16,
-    #         recondition_every_nth_frame=16,
-    #         masklet_confirmation_enable=False,
+    #         max_trk_keep_alive=100,
+    #         init_trk_keep_alive=5,
+    #         suppress_overlapping_based_on_recent_occlusion_threshold=0.9,
+    #         suppress_det_close_to_boundary=True,
+    #         fill_hole_area=4,
+    #         recondition_every_nth_frame=64,
+    #         masklet_confirmation_enable=True,
     #         decrease_trk_keep_alive_for_empty_masklets=True,
     #         image_size=1008,
     #         image_mean=(0.5, 0.5, 0.5),
     #         image_std=(0.5, 0.5, 0.5),
     #         compile_model=compile,
     #     )
-
-    if apply_temporal_disambiguation:
-        model = Sam3VideoInferenceWithInstanceInteractivity(
-            detector=detector,
-            tracker=tracker,
-            score_threshold_detection=0.65,
-            assoc_iou_thresh=0.3,
-            det_nms_thresh=0.1,
-            new_det_thresh=0.99,
-            hotstart_delay=8,
-            hotstart_unmatch_thresh=5,
-            hotstart_dup_thresh=5,
-            suppress_unmatched_only_within_hotstart=False,
-            min_trk_keep_alive=-1,
-            max_trk_keep_alive=100,
-            init_trk_keep_alive=10,
-            suppress_overlapping_based_on_recent_occlusion_threshold=0.6,
-            suppress_det_close_to_boundary=False,
-            fill_hole_area=32,
-            recondition_every_nth_frame=16,
-            masklet_confirmation_enable=False,
-            decrease_trk_keep_alive_for_empty_masklets=True,
-            image_size=1008,
-            image_mean=(0.5, 0.5, 0.5),
-            image_std=(0.5, 0.5, 0.5),
-            compile_model=compile,
-        )
     else:
         model = Sam3VideoInferenceWithInstanceInteractivity(
             detector=detector,
@@ -810,20 +755,20 @@ def build_sam3_video_model(
             score_threshold_detection=0.55,
             assoc_iou_thresh=0.1,
             det_nms_thresh=0.1,
-            new_det_thresh=0.55,
-            hotstart_delay=0,
+            new_det_thresh=1.0,
+            hotstart_delay=15,
             hotstart_unmatch_thresh=8,
             hotstart_dup_thresh=8,
-            suppress_unmatched_only_within_hotstart=False,
+            suppress_unmatched_only_within_hotstart=True,
             min_trk_keep_alive=-1,
-            max_trk_keep_alive=200,
-            init_trk_keep_alive=10,
-            suppress_overlapping_based_on_recent_occlusion_threshold=0.7,
+            max_trk_keep_alive=30,
+            init_trk_keep_alive=30,
+            suppress_overlapping_based_on_recent_occlusion_threshold=0.6,
             suppress_det_close_to_boundary=False,
             fill_hole_area=8,
             recondition_every_nth_frame=16,
             masklet_confirmation_enable=False,
-            decrease_trk_keep_alive_for_empty_masklets=True,
+            decrease_trk_keep_alive_for_empty_masklets=False,
             image_size=1008,
             image_mean=(0.5, 0.5, 0.5),
             image_std=(0.5, 0.5, 0.5),
