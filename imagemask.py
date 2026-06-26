@@ -1,10 +1,38 @@
-import torch, math, cv2, av, base64, subprocess, functools, os, re, logger, time, threading, numpy as np, torchvision
+import torch, math, cv2, av, base64, subprocess, functools, os, re, logger, time, threading, numpy as np, torchvision, json
 from io import BytesIO
-from PIL import Image, ImageSequence, ImageOps, Image
+from PIL import Image, ImageSequence, ImageOps, Image, ImageFilter
 from tqdm import tqdm
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
+
+def have(a):
+    return a is not None  
+
+def aorb(a, b):
+    return a if have(a) else b
+
+def aborc(a, b, c):
+    return aorb(a, aorb(b, c))
+
+def abcord(a, b, c, d):
+    return aorb(a, aborc(b, c, d))
+
+def np2tensor(img_np: np.ndarray | list[np.ndarray]) -> torch.Tensor:
+    if isinstance(img_np, list):
+        return torch.cat([np2tensor(img) for img in img_np], dim=0)
+
+    return torch.from_numpy(img_np.astype(np.float32) / 255.0).unsqueeze(0)
+
+def tensor2np(tensor: torch.Tensor) -> list[np.ndarray]:
+    batch_count = tensor.size(0) if len(tensor.shape) > 3 else 1
+    if batch_count > 1:
+        out = []
+        for i in range(batch_count):
+            out.extend(tensor2np(tensor[i]))
+        return out
+
+    return [np.clip(255.0 * tensor.cpu().numpy().squeeze(), 0, 255).astype(np.uint8)]
 
 def ensure_mask_type(func):
     @functools.wraps(func)
@@ -68,6 +96,7 @@ def feather_mask(mask: torch.Tensor, blur_radius: float = 1.5, iterations: int =
 
 @ensure_mask_type
 def morph3x3(mask: torch.Tensor, dilation: int) -> torch.Tensor:
+    dilation = int(dilation)
     if dilation == 0: return mask
     orig_shape = mask.shape
     x = mask.float()
@@ -83,6 +112,7 @@ def morph3x3(mask: torch.Tensor, dilation: int) -> torch.Tensor:
 
 @ensure_mask_type
 def mask_edges(mask: torch.Tensor, kernel_size: int = 1) -> torch.Tensor:
+    kernel_size = int(kernel_size)
     if kernel_size <= 0: return mask
     orig_shape = mask.shape
     x = mask.float()
@@ -103,9 +133,38 @@ def mask_edges(mask: torch.Tensor, kernel_size: int = 1) -> torch.Tensor:
     return (x > 0.5).view(orig_shape).float()
 
 @ensure_mask_type
+def davinci_resolve_smooth(mask: torch.Tensor, glow_radius: float = 3.0, glow_density: float = 2.0, bg_blur_radius: float = 3.0, shrink: int = 1) -> torch.Tensor:
+    orig_shape = mask.shape
+    x = mask.float()
+    if x.ndim == 2: x = x[None, None, ...]
+    elif x.ndim == 3: x = x[None, ...]
+    
+    # 1. Blur the black background and cut it out of the white mask (Eats peninsulas)
+    if bg_blur_radius > 0:
+        bg = 1.0 - x
+        k_size_bg = int(bg_blur_radius * 2) + 1
+        blurred_bg = torchvision.transforms.functional.gaussian_blur(bg, kernel_size=k_size_bg, sigma=float(bg_blur_radius))
+        x = torch.clamp(x - blurred_bg, 0.0, 1.0)
+        
+    # 2. Dense thin glow (Fills bays)
+    if glow_radius > 0:
+        k_size_glow = int(glow_radius * 2) + 1
+        blurred_x = torchvision.transforms.functional.gaussian_blur(x, kernel_size=k_size_glow, sigma=float(glow_radius))
+        dense_glow = torch.clamp(blurred_x * glow_density, 0.0, 1.0)
+        x = torch.maximum(x, dense_glow)
+        
+    # 3. "Dilate that back a tiny bit" (Erode to shrink the expanded glow)
+    if shrink > 0:
+        k_size_shrink = int(shrink * 2) + 1
+        pad = int(shrink)
+        x = -torch.nn.functional.max_pool2d(-x, kernel_size=k_size_shrink, stride=1, padding=pad)
+        
+    return (x > 0.5).view(orig_shape).float()
+
+@ensure_mask_type
 def process_mask(mask: torch.Tensor, sensitivity=1.0, mask_blur=0, mask_offset=0, smooth=0.0, 
                  fill_holes=False, invert_output=False, 
-                 dilation=0, feather_radius=0.0, smooth_edges=0):
+                 dilation=0, feather_radius=0.0, smooth_edges=0, davinci=False):
     
     actual_offset = mask_offset if mask_offset != 0 else dilation
     actual_blur = mask_blur if mask_blur > 0 else feather_radius
@@ -133,6 +192,9 @@ def process_mask(mask: torch.Tensor, sensitivity=1.0, mask_blur=0, mask_offset=0
     if actual_offset != 0:
         m = morph3x3.__wrapped__(m, actual_offset)
         
+    if davinci:
+        m = davinci_resolve_smooth.__wrapped__(m, glow_radius=5.0, glow_density=4.5, bg_blur_radius=4.0, shrink=1)
+
     if smooth_edges > 0:
         m = mask_edges.__wrapped__(m, kernel_size=smooth_edges)
         
@@ -1080,3 +1142,558 @@ class TorchCodecVideoLoader:
     def get_all_frames(self, start=0, max_frames=None):
         end = min(start + max_frames, self.num_frames) if max_frames else self.num_frames
         return torch.stack([self[i] for i in range(start, end)])
+
+def parse_points(points_str, image_shape=None):
+    if not points_str or not points_str.strip():
+        return None, None, []
+
+    try:
+        parsed_data = json.loads(points_str)
+
+        if isinstance(parsed_data, dict) and "points" in parsed_data:
+            points = parsed_data["points"]
+            if not points:
+                return None, None
+            return points, len(points), []
+
+        if not isinstance(parsed_data, list):
+            raise ValueError(f"Points must be a JSON array or object with 'points' key, got {type(parsed_data).__name__}")
+
+        if len(parsed_data) == 0:
+            return None, None, []
+
+        points = []
+        battle_cruisers = []
+
+        for i, point_dict in enumerate(parsed_data):
+            if not isinstance(point_dict, dict):
+                err = f"Point {i} is not a dictionary"
+                print(f"Warning: {err}, skipping")
+                battle_cruisers.append(err)
+                continue
+
+            if 'x' not in point_dict or 'y' not in point_dict:
+                err = f"Point {i} missing 'x' or 'y' key"
+                print(f"Warning: {err}, skipping")
+                battle_cruisers.append(err)
+                continue
+
+            try:
+                x = float(point_dict['x'])
+                y = float(point_dict['y'])
+
+                if x < 0 or y < 0:
+                    err = f"Point {i} has negative coordinates ({x}, {y})"
+                    print(f"Warning: {err}, skipping")
+                    battle_cruisers.append(err)
+                    continue
+
+                if image_shape is not None:
+                    height, width = image_shape[1], image_shape[2]  
+                
+                    if x >= width or y >= height:
+                        err = f"Point {i} ({x}, {y}) outside image bounds ({width}x{height})"
+                        print(f"Warning: {err}, skipping")
+                        battle_cruisers.append(err)
+                        continue
+                    
+                    x = x / width
+                    y = y / height
+
+                points.append([x, y])
+
+            except (ValueError, TypeError) as e:
+                err = f"Could not convert point {i} coordinates to float: {e}"
+                print(f"Warning: {err}, skipping")
+                battle_cruisers.append(err)
+                continue
+
+        if not points:
+            return None, None, battle_cruisers
+
+        return points, len(points), battle_cruisers
+
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in points: {str(e)}")
+    except Exception as e:
+        print(f"Error parsing points: {e}")
+        return None, None, [str(e)]
+
+def parse_bbox(bbox, image_shape=None):
+
+    if bbox is None:
+        return None, 0
+
+    try:
+        if isinstance(bbox, str):
+            bbox = json.loads(bbox)
+        
+        if isinstance(bbox, dict) and "boxes" in bbox:
+            boxes = bbox["boxes"]
+            if not boxes:
+                return None, 0
+            return boxes, len(boxes)
+        
+        all_coords = []
+
+        if hasattr(bbox, '__iter__') and not isinstance(bbox, (str, bytes)):
+            try:
+                bbox_list = list(bbox)
+                if len(bbox_list) == 0:
+                    return None, 0
+
+                if len(bbox_list) == 4 and all(isinstance(x, (int, float)) for x in bbox_list):
+                    coords = [float(x) for x in bbox_list]
+                    all_coords.append(coords)
+                else:
+                    for elem in bbox_list:
+                        coords = None
+
+                        if hasattr(elem, '__getitem__'):
+                            try:
+                                x1 = float(elem['startX'])
+                                y1 = float(elem['startY'])
+                                x2 = float(elem['endX'])
+                                y2 = float(elem['endY'])
+                                coords = [x1, y1, x2, y2]
+                            except (KeyError, TypeError):
+                                pass
+                        
+                        if coords is None:
+                            if hasattr(elem, '__iter__') and not isinstance(elem, (str, bytes)):
+                                inner = list(elem)
+                                if len(inner) == 4:
+                                    coords = [float(x) for x in inner]
+                        if coords is not None:
+                            all_coords.append(coords)
+
+            except Exception as e:
+                raise ValueError(f"Failed to process bbox as sequence: {e}")
+
+        elif hasattr(bbox, '__getitem__'):
+            try:
+                x1 = float(bbox['startX'])
+                y1 = float(bbox['startY'])
+                x2 = float(bbox['endX'])
+                y2 = float(bbox['endY'])
+                coords = [x1, y1, x2, y2]
+                all_coords.append(coords)
+            except (KeyError, TypeError) as e:
+                raise ValueError(f"Dictionary bbox missing required keys: {e}")
+
+        else:
+            raise ValueError(f"Unsupported bbox type: {type(bbox)}")
+
+        if not all_coords:
+            raise ValueError(
+                f"Could not extract coordinates from bbox. Type: {type(bbox)}, Content: {repr(bbox)[:200]}")
+
+        validated_coords = []
+        for coords in all_coords:
+        
+            x1, y1, x2, y2 = coords
+            if x2 < x1 or y2 < y1:
+             
+                width, height = x2, y2
+                x2 = x1 + width
+                y2 = y1 + height
+                coords = [x1, y1, x2, y2]
+
+            if coords[0] >= coords[2]:
+                raise ValueError(f"Invalid bbox: x1 ({coords[0]}) must be < x2 ({coords[2]})")
+            if coords[1] >= coords[3]:
+                raise ValueError(f"Invalid bbox: y1 ({coords[1]}) must be < y2 ({coords[3]})")
+            if coords[0] < 0 or coords[1] < 0:
+                raise ValueError(f"Bounding box coordinates must be non-negative, got x1={coords[0]}, y1={coords[1]}")
+     
+            if image_shape is not None:
+                height, width = image_shape[1], image_shape[2]
+                
+                if coords[0] >= width or coords[2] > width:
+                    print(f"Warning: bbox x coordinates ({coords[0]}, {coords[2]}) outside image width ({width})")
+                if coords[1] >= height or coords[3] > height:
+                    print(f"Warning: bbox y coordinates ({coords[1]}, {coords[3]}) outside image height ({height})")
+
+                x1 = coords[0] / width
+                y1 = coords[1] / height
+                x2 = coords[2] / width
+                y2 = coords[3] / height
+                new_coords = [
+                    (x1 + x2) / 2,
+                    (y1 + y2) / 2,
+                    x2 - x1,
+                    y2 - y1
+                ]
+            
+                validated_coords.append(new_coords)
+            else:
+                validated_coords.append(coords)
+
+        return validated_coords, len(validated_coords)
+
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in bbox: {str(e)}")
+    except (ValueError, TypeError) as e:
+        error_msg = f"Invalid bbox: {str(e)}\n"
+        error_msg += f"Input type: {type(bbox)}\n"
+        error_msg += f"Input content: {repr(bbox)[:500]}"
+        raise ValueError(error_msg)
+
+def expand_mask(self, mask, expand, tapered_corners, flip_input, blur_radius, incremental_expandrate, lerp_alpha, decay_factor, fill_holes=False):
+    import kornia.morphology as morph
+    import scipy
+    alpha = lerp_alpha
+    decay = decay_factor
+    if flip_input:
+        mask = 1.0 - mask
+
+    growmask = mask.reshape((-1, mask.shape[-2], mask.shape[-1]))
+    out = []
+    previous_output = None
+    current_expand = expand
+    for m in tqdm(growmask, desc="Expanding/Contracting Mask"):
+        output = m.unsqueeze(0).unsqueeze(0).to(device)  
+        if abs(round(current_expand)) > 0 and output.max() > 0:
+
+            if tapered_corners:
+                kernel = torch.tensor([[0, 1, 0],
+                                    [1, 1, 1],
+                                    [0, 1, 0]], dtype=torch.float32, device=output.device)
+            else:
+                kernel = torch.tensor([[1, 1, 1],
+                                    [1, 1, 1],
+                                    [1, 1, 1]], dtype=torch.float32, device=output.device)
+            
+            for _ in range(abs(round(current_expand))):
+                if current_expand < 0:
+                    output = morph.erosion(output, kernel)
+                else:
+                    output = morph.dilation(output, kernel)
+        
+        output = output.squeeze(0).squeeze(0)  # Remove batch and channel dims
+        
+        if current_expand < 0:
+            current_expand -= abs(incremental_expandrate)
+        else:
+            current_expand += abs(incremental_expandrate)
+            
+        if fill_holes:
+            binary_mask = output > 0
+            output_np = binary_mask.cpu().numpy()
+            filled = scipy.ndimage.binary_fill_holes(output_np)
+            output = torch.from_numpy(filled.astype(np.float32)).to(output.device)
+        
+        if alpha < 1.0 and previous_output is not None:
+            output = alpha * output + (1 - alpha) * previous_output
+        if decay < 1.0 and previous_output is not None:
+            output += decay * previous_output
+            output = output / output.max()
+        previous_output = output
+        out.append(output.cpu())
+
+    if blur_radius != 0:
+        # Convert the tensor list to PIL images, apply blur, and convert back
+        for idx, tensor in enumerate(out):
+            # Convert tensor to PIL image
+            pil_image = tensor2pil(tensor.cpu().detach())[0]
+            # Apply Gaussian blur
+            pil_image = pil_image.filter(ImageFilter.GaussianBlur(blur_radius))
+            # Convert back to tensor
+            out[idx] = pil2tensor(pil_image)
+        blurred = torch.cat(out, dim=0)
+        return (blurred, 1.0 - blurred)
+    else:
+        return (torch.stack(out, dim=0), 1.0 - torch.stack(out, dim=0),)
+    
+def remap(img, flow, border_mode = cv2.BORDER_REFLECT_101):
+    # copyMakeBorder doesn't support wrap, but supports replicate. Replaces wrap with reflect101.
+    if border_mode == cv2.BORDER_WRAP:
+        border_mode = cv2.BORDER_REFLECT_101
+    h, w = img.shape[:2]
+    displacement = int(h * 0.25), int(w * 0.25)
+    larger_img = cv2.copyMakeBorder(img, displacement[0], displacement[0], displacement[1], displacement[1], border_mode)
+    lh, lw = larger_img.shape[:2]
+    larger_flow = extend_flow(flow, lw, lh)
+    remapped_img = cv2.remap(larger_img, larger_flow, None, cv2.INTER_LINEAR, border_mode)
+    output_img = center_crop_image(remapped_img, w, h)
+    return output_img
+
+def center_crop_image(img, w, h):
+    y, x, _ = img.shape
+    width_indent = int((x - w) / 2)
+    height_indent = int((y - h) / 2)
+    cropped_img = img[height_indent:y-height_indent, width_indent:x-width_indent]
+    return cropped_img
+
+def extend_flow(flow, w, h):
+    # Get the shape of the original flow image
+    flow_h, flow_w = flow.shape[:2]
+    # Calculate the position of the image in the new image
+    x_offset = int((w - flow_w) / 2)
+    y_offset = int((h - flow_h) / 2)
+    # Generate the X and Y grids
+    x_grid, y_grid = np.meshgrid(np.arange(w), np.arange(h))
+    # Create the new flow image and set it to the X and Y grids
+    new_flow = np.dstack((x_grid, y_grid)).astype(np.float32)
+    # Shift the values of the original flow by the size of the border
+    flow[:,:,0] += x_offset
+    flow[:,:,1] += y_offset
+    # Overwrite the middle of the grid with the original flow
+    new_flow[y_offset:y_offset+flow_h, x_offset:x_offset+flow_w, :] = flow
+    # Return the extended image
+    return new_flow
+
+def get_flow_from_images(i1, i2, method, prev_flow=None):
+    if method == "DIS Medium":
+        flow = get_flow_from_images_DIS(i1, i2, 'medium', prev_flow)
+    elif method == "DIS Fine":
+        flow = get_flow_from_images_DIS(i1, i2, 'fine', prev_flow)
+    elif method == "Farneback": # Farneback Normal:
+        flow = get_flow_from_images_Farneback(i1, i2, prev_flow)
+    else:
+        # if we reached this point, something went wrong. raise an error:
+        raise RuntimeError(f"Invald flow method name: '{method}'")
+
+    return flow
+
+def get_flow_from_images_DIS(i1, i2, preset, prev_flow):
+    # DIS PRESETS CHART KEY: finest scale, grad desc its, patch size
+    # DIS_MEDIUM: 1, 25, 8 | DIS_FAST: 2, 16, 8 | DIS_ULTRAFAST: 2, 12, 8
+    if preset == 'medium': preset_code = cv2.DISOPTICAL_FLOW_PRESET_MEDIUM    
+    elif preset == 'fast': preset_code = cv2.DISOPTICAL_FLOW_PRESET_FAST    
+    elif preset == 'ultrafast': preset_code = cv2.DISOPTICAL_FLOW_PRESET_ULTRAFAST   
+    elif preset in ['slow','fine']: preset_code = None
+    i1 = cv2.cvtColor(i1, cv2.COLOR_BGR2GRAY)
+    i2 = cv2.cvtColor(i2, cv2.COLOR_BGR2GRAY)
+    dis = cv2.DISOpticalFlow_create(preset_code)
+    # custom presets
+    if preset == 'slow':
+        dis.setGradientDescentIterations(192)
+        dis.setFinestScale(1)
+        dis.setPatchSize(8)
+        dis.setPatchStride(4)
+    if preset == 'fine':
+        dis.setGradientDescentIterations(192)
+        dis.setFinestScale(0)
+        dis.setPatchSize(8)
+        dis.setPatchStride(4)
+    return dis.calc(i1, i2, prev_flow)
+
+def get_flow_from_images_Farneback(i1, i2, preset="normal", last_flow=None, pyr_scale = 0.5, levels = 3, winsize = 15, iterations = 3, poly_n = 5, poly_sigma = 1.2, flags = 0):
+    flags = cv2.OPTFLOW_FARNEBACK_GAUSSIAN         # Specify the operation flags
+    pyr_scale = 0.5   # The image scale (<1) to build pyramids for each image
+    if preset == "fine":
+        levels = 13       # The number of pyramid layers, including the initial image
+        winsize = 77      # The averaging window size
+        iterations = 13   # The number of iterations at each pyramid level
+        poly_n = 15       # The size of the pixel neighborhood used to find polynomial expansion in each pixel
+        poly_sigma = 0.8  # The standard deviation of the Gaussian used to smooth derivatives used as a basis for the polynomial expansion
+    else: # "normal"
+        levels = 5        # The number of pyramid layers, including the initial image
+        winsize = 21      # The averaging window size
+        iterations = 5    # The number of iterations at each pyramid level
+        poly_n = 7        # The size of the pixel neighborhood used to find polynomial expansion in each pixel
+        poly_sigma = 1.2  # The standard deviation of the Gaussian used to smooth derivatives used as a basis for the polynomial expansion
+    i1 = cv2.cvtColor(i1, cv2.COLOR_BGR2GRAY)
+    i2 = cv2.cvtColor(i2, cv2.COLOR_BGR2GRAY)
+    flags = 0 # flags = cv2.OPTFLOW_USE_INITIAL_FLOW    
+    flow = cv2.calcOpticalFlowFarneback(i1, i2, last_flow, pyr_scale, levels, winsize, iterations, poly_n, poly_sigma, flags)
+    return flow
+
+def image_transform_optical_flow(img, flow, border_mode=cv2.BORDER_REPLICATE, flow_reverse=False):
+    if not flow_reverse:
+        flow = -flow
+    h, w = img.shape[:2]
+    flow[:, :, 0] += np.arange(w)
+    flow[:, :, 1] += np.arange(h)[:,np.newaxis]
+    return remap(img, flow, border_mode)
+
+def draw_flow_lines_in_grid_in_color(img, flow, step=8, magnitude_multiplier=1, min_magnitude = 0, max_magnitude = 10000):
+    flow = flow * magnitude_multiplier
+    h, w = img.shape[:2]
+    y, x = np.mgrid[step/2:h:step, step/2:w:step].reshape(2,-1).astype(int)
+    fx, fy = flow[y,x].T
+    lines = np.vstack([x, y, x+fx, y+fy]).T.reshape(-1, 2, 2)
+    lines = np.int32(lines + 0.5)
+    vis = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
+
+    mag, ang = cv2.cartToPolar(flow[...,0], flow[...,1])
+    hsv = np.zeros((flow.shape[0], flow.shape[1], 3), dtype=np.uint8)
+    hsv[...,0] = ang*180/np.pi/2
+    hsv[...,1] = 255
+    hsv[...,2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)
+    bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    vis = cv2.add(vis, bgr)
+
+    # Iterate through the lines
+    for (x1, y1), (x2, y2) in lines:
+        # Calculate the magnitude of the line
+        magnitude = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+
+        # Only draw the line if it falls within the magnitude range
+        if min_magnitude <= magnitude <= max_magnitude:
+            b = int(bgr[y1, x1, 0])
+            g = int(bgr[y1, x1, 1])
+            r = int(bgr[y1, x1, 2])
+            color = (b, g, r)
+            cv2.arrowedLine(vis, (x1, y1), (x2, y2), color, thickness=1, tipLength=0.1)    
+    return vis
+
+def visualize_flow(flow_img, flow):
+    flow_img = cv2.cvtColor(flow_img, cv2.COLOR_RGB2GRAY)
+    flow_img = cv2.cvtColor(flow_img, cv2.COLOR_GRAY2BGR)
+    flow_img = draw_flow_lines_in_grid_in_color(flow_img, flow)
+    return cv2.cvtColor(flow_img, cv2.COLOR_BGR2RGB)
+
+class ComputeOpticalFlow:
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prev": ("IMAGE",),
+                "current": ("IMAGE",),
+                "method": ([
+                    "DIS Medium",
+                    "DIS Fine",
+                    "Farneback",
+                ],),
+            },
+        }
+
+    RETURN_TYPES = ("OPTICAL_FLOW",)
+    FUNCTION = "compute_flow"
+    CATEGORY = "Optical flow"
+
+    def compute_flow(self, prev, current, method):
+        images = zip(tensor2np(prev), tensor2np(current))
+        return ([get_flow_from_images(im1, im2, method) for im1, im2 in images],)
+
+class ApplyOpticalFlow:
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "flow": ("OPTICAL_FLOW",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "apply_flow"
+    CATEGORY = "Optical flow"
+
+    def apply_flow(self, image, flow):
+        ims = tensor2np(image)
+        out = [image_transform_optical_flow(im, f) for im, f in zip(ims, flow)]
+        return (np2tensor(out),)
+
+class VisualizeOpticalFlow:
+    """Visualize a flow as a set of arrows superimposed on the original image."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "flow": ("OPTICAL_FLOW",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "visualize_flow"
+    CATEGORY = "Optical flow"
+
+    def visualize_flow(self, image, flow):
+        ifs = zip(tensor2np(image), flow)
+        out = [visualize_flow(img, flow) for img, flow in ifs]
+        return (np2tensor(out),)
+
+def propagate_in_video(predictor, session_id):
+    outputs_per_frame = {}
+    for response in predictor.handle_stream_request(
+        request=dict(type="propagate_in_video", session_id=session_id)):
+        outputs_per_frame[response["frame_index"]] = response["outputs"]
+    return outputs_per_frame
+
+def abs_to_rel_coords(coords, IMG_WIDTH, IMG_HEIGHT, coord_type="point"):
+    if coord_type == "point":
+        return [[x / IMG_WIDTH, y / IMG_HEIGHT] for x, y in coords]
+    elif coord_type == "box":
+        return [[x / IMG_WIDTH, y / IMG_HEIGHT, w / IMG_WIDTH, h / IMG_HEIGHT] for x, y, w, h in coords]
+    else:
+        raise ValueError(f"Unknown coord_type: {coord_type}")
+
+class raft_flow:
+    def __init__(self, device, max_size=1008, flow_scale=1.0, interp_mode="bicubic"):
+
+        try:
+            from torchvision.models.optical_flow import raft_small, Raft_Small_Weights # from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
+            HAS_RAFT = True
+        except ImportError:
+            HAS_RAFT = False
+
+        self.device = torch.device(device) if isinstance(device, str) else (device or torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+        self.max_size = max_size
+        self.flow_scale = flow_scale
+        self.interp_mode = interp_mode
+        self.weights = Raft_Small_Weights.DEFAULT
+        self.model = raft_small(weights=self.weights, progress=False).to(self.device).eval()
+        self.transforms = self.weights.transforms()     
+ 
+    def compute_raft_flow(self, img1a, img2a, max_size, scale, interp_mode, target_size):
+
+        origH, origW =  torchvision.transforms.functional.get_image_size(img1a)
+        current_H, current_W = origH * scale, origW * scale 
+
+        if max(current_H, current_W) > max_size:
+            scale = scale * (max_size / float(max(current_H, current_W)))
+
+        if scale != 1.0:
+            newH, newW = int(origH * scale), int(origW * scale)
+            img1b = torch.nn.functional.interpolate(img1a, size=(newH, newW), mode=interp_mode, antialias=True)
+            img2b = torch.nn.functional.interpolate(img2a, size=(newH, newW), mode=interp_mode, antialias=True)
+        else:
+            newH, newW = origH, origW
+            img1b, img2b = img1a, img2a
+
+        img1c, img2c = self.transforms(img1b, img2b)
+        _, _, H_s, W_s = img1c.shape
+        padh, padw = (8 - H_s % 8) % 8, (8 - W_s % 8) % 8
+
+        if padh > 0 or padw > 0:
+            img1c = torch.nn.functional.pad(img1c, (0, padw, 0, padh))
+            img2c = torch.nn.functional.pad(img2c, (0, padw, 0, padh))
+
+        flow = self.model(img1c, img2c)[-1].float()
+        if padh > 0 or padw > 0:
+            flow = flow[:, :, :H_s, :W_s]
+
+        out_H, out_W = target_size if target_size else (origH, origW)
+        if out_H != H_s or out_W != W_s:
+            flow = torch.nn.functional.interpolate(flow, size=(out_H, out_W), mode=interp_mode, antialias=True)
+            flow[:, 0] *= (out_W / W_s)
+            flow[:, 1] *= (out_H / H_s)
+                
+        return flow
+
+    def warp_frame(self, a, b, scale=1.0, mode="bicubic", N=None):
+    
+        if a.ndim == 3: 
+            C, H, W = a.shape 
+        if a.ndim == 4: 
+            N, C, H, W = a.shape
+        
+        scaled = b * scale
+        y, x = torch.meshgrid(torch.arange(H, device=self.device), torch.arange(W, device=self.device), indexing='ij')
+        x_norm = 2.0 * (x + scaled[0]) / max(W - 1, 1) - 1.0
+        y_norm = 2.0 * (y + scaled[1]) / max(H - 1, 1) - 1.0
+        grid = torch.stack((x_norm, y_norm), dim=-1).unsqueeze(0)
+        grid = grid.expand(N, -1, -1, -1) if have(N) else grid
+        return torch.nn.functional.grid_sample(a, grid, mode=mode, padding_mode='border', align_corners=True) if have(N) else torch.nn.functional.grid_sample(a.unsqueeze(0), grid, mode=mode, padding_mode='border', align_corners=True).squeeze(0)
