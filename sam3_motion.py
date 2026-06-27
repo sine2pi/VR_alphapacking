@@ -2,7 +2,7 @@ import logging, os, glob, json
 from tqdm import tqdm
 from imagemask import *
 from sam3.model_builder import build_sam3_predictor
-from model_builder import build_sam3_video_predictor, build_sam3_image_model
+from model_builder import build_sam3_video_predictor
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -56,20 +56,48 @@ def metadata(path):
         
     return frames, keyframes, width, height, duration, fps
 
-def ffmpeg_pipe(out_path, width, height, fps):
+def ffmpeg_pipe(out_path, width, height, fps, audio_source=None):
 
     ffmpeg_cmd = [
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo', '-s', f'{width}x{height}', '-pix_fmt', 'bgr24', '-r', str(fps),
-        '-y', '-i', '-', '-sws_flags', 'bicubic+full_chroma_int+accurate_rnd+full_chroma_inp', '-c:v', 'hevc_qsv', '-profile:v', 'main10', '-pix_fmt', 'p010le', '-tag:v', 'hvc1', '-g', '100', '-b:v', '100M', '-preset', 'medium', '-c:a', 'aac', '-b:a', '256k', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-fps_mode', 'cfr', '-r', str(fps), '-movflags', '+faststart+write_colr+use_metadata_tags', '-metadata:s:v:0', 'stereo_mode=left_right', '-color_trc', 'bt709', '-color_range', 'pc', out_path
+        '-i', '-'
     ]
+    
+    if audio_source:
+        ffmpeg_cmd.extend(['-i', audio_source, '-map', '0:v', '-map', '1:a?'])
+        
+    ffmpeg_cmd.extend([
+        '-sws_flags', 'bicubic+full_chroma_int+accurate_rnd+full_chroma_inp', '-c:v', 'hevc_qsv', '-profile:v', 'main10', '-pix_fmt', 'p010le', '-tag:v', 'hvc1', '-g', '100', '-b:v', '100M', '-preset', 'medium', '-c:a', 'aac', '-b:a', '256k', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-fps_mode', 'cfr', '-r', str(fps), '-movflags', '+faststart+write_colr+use_metadata_tags', '-metadata:s:v:0', 'stereo_mode=left_right', '-color_trc', 'bt709', '-color_range', 'pc', out_path
+    ])
     return subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 class AlphaPacker:
-    def __init__(self, scale=0.40, padding=0):
+    def __init__(self, scale=0.40, padding=0, circle=False):
 
         self.scale = scale
         self.padding = padding
-        self.circle_cache = None
+        self.circle = circle
+        self._cache = None
+
+    def _circle(self, w, h):
+        if self._cache is not None and self._cache.shape == (h, w):
+            return self._cache
+
+        y = np.arange(h, dtype=np.float32)
+        x = np.arange(w, dtype=np.float32)
+        grid_y, grid_x = np.meshgrid(y, x, indexing='ij')
+
+        cy, cx = h / 2.0 - 0.5, w / 2.0 - 0.5
+        r = np.sqrt((grid_x - cx)**2 + (grid_y - cy)**2)
+
+        max_r = min(w, h) / 2.0
+        outer_r = max_r * 0.55  
+        inner_r = max_r * 0.45  
+        
+        t = np.clip((outer_r - r) / (outer_r - inner_r), 0.0, 1.0) 
+        cache = t * t * (3.0 - 2.0 * t)
+        self._cache = cache
+        return self._cache
 
     def pack_frame(self, frames, mask_l = None, mask_r = None):
 
@@ -93,25 +121,43 @@ class AlphaPacker:
         else:
             r_small = mask_r
 
-        mask_l_circle = l_small.astype(np.uint8) 
-        mask_r_circle = r_small.astype(np.uint8) 
+        mask_l = l_small.astype(np.uint8) 
+        mask_r = r_small.astype(np.uint8) 
 
         packed_frame = frames
         h_half = target_h // 2
-        top_half_mask = mask_l_circle[:h_half, :]
-        bottom_half_mask = mask_l_circle[h_half:h_half*2, :]
+        top_half_mask = mask_l[:h_half, :]
+        bottom_half_mask = mask_l[h_half:h_half*2, :]
 
         w_half = target_w // 2
-        q_tl_mask = mask_r_circle[:h_half, :w_half]
-        q_tr_mask = mask_r_circle[:h_half, w_half:w_half*2]
-        q_bl_mask = mask_r_circle[h_half:h_half*2, :w_half]
-        q_br_mask = mask_r_circle[h_half:h_half*2, w_half:w_half*2]
+        q_tl_mask = mask_r[:h_half, :w_half]
+        q_tr_mask = mask_r[:h_half, w_half:w_half*2]
+        q_bl_mask = mask_r[h_half:h_half*2, :w_half]
+        q_br_mask = mask_r[h_half:h_half*2, w_half:w_half*2]
+        q_tl_circle = None
+        q_tr_circle = None
+        q_bl_circle = None 
+        q_br_circle = None
 
-        def blend_white_mask(roi, mask_1ch):
-            inv_mask_3d = (255 - mask_1ch)[..., np.newaxis]
-            blended = (roi.astype(np.uint16) * inv_mask_3d) // 255
-            blended += mask_1ch[..., np.newaxis]
-            return blended.astype(np.uint8)
+        if self.circle:
+            circle = self._circle(target_w, target_h) 
+            inv_circle_3d = (1.0 - circle)[..., np.newaxis].astype(np.float32)
+            q_tl_circle = inv_circle_3d[:h_half, :w_half]
+            q_tr_circle = inv_circle_3d[:h_half, w_half:w_half*2]
+            q_bl_circle = inv_circle_3d[h_half:h_half*2, :w_half]
+            q_br_circle = inv_circle_3d[h_half:h_half*2, w_half:w_half*2]
+               
+        def blend_white_mask(roi, mask_1ch, inv_circle_slice=None):
+            if inv_circle_slice is None:
+                inv_mask_3d = (255 - mask_1ch)[..., np.newaxis]
+                blended = (roi.astype(np.uint16) * inv_mask_3d) // 255
+                blended += mask_1ch[..., np.newaxis]
+                x = blended.astype(np.uint8)
+            else:
+                blended = roi.astype(np.float32) * inv_circle_slice
+                blended += mask_1ch[..., np.newaxis]
+                x = np.clip(blended, 0, 255).astype(np.uint8)
+            return x
 
         y1_top = self.padding
         y2_top = y1_top + h_half
@@ -127,25 +173,25 @@ class AlphaPacker:
         y2_tr = y1_tr + h_half
         x1_tr = SBS_W - self.padding - w_half
         x2_tr = SBS_W - self.padding
-        packed_frame[y1_tr:y2_tr, x1_tr:x2_tr] = blend_white_mask(packed_frame[y1_tr:y2_tr, x1_tr:x2_tr], q_bl_mask)
+        packed_frame[y1_tr:y2_tr, x1_tr:x2_tr] = blend_white_mask(packed_frame[y1_tr:y2_tr, x1_tr:x2_tr], q_bl_mask, q_bl_circle)
 
         y1_tl_l = self.padding
         y2_tl_l = y1_tl_l + h_half
         x1_tl_l = self.padding
         x2_tl_l = self.padding + w_half
-        packed_frame[y1_tl_l:y2_tl_l, x1_tl_l:x2_tl_l] = blend_white_mask(packed_frame[y1_tl_l:y2_tl_l, x1_tl_l:x2_tl_l], q_br_mask)
+        packed_frame[y1_tl_l:y2_tl_l, x1_tl_l:x2_tl_l] = blend_white_mask(packed_frame[y1_tl_l:y2_tl_l, x1_tl_l:x2_tl_l], q_br_mask, q_br_circle)
 
         y1_br_r = H - self.padding - h_half
         y2_br_r = y1_br_r + h_half
         x1_br_r = SBS_W - self.padding - w_half
         x2_br_r = SBS_W - self.padding
-        packed_frame[y1_br_r:y2_br_r, x1_br_r:x2_br_r] = blend_white_mask(packed_frame[y1_br_r:y2_br_r, x1_br_r:x2_br_r], q_tl_mask)
+        packed_frame[y1_br_r:y2_br_r, x1_br_r:x2_br_r] = blend_white_mask(packed_frame[y1_br_r:y2_br_r, x1_br_r:x2_br_r], q_tl_mask, q_tl_circle)
 
         y1_bl_l = H - self.padding - h_half
         y2_bl_l = y1_bl_l + h_half
         x1_bl_l = self.padding
         x2_bl_l = self.padding + w_half
-        packed_frame[y1_bl_l:y2_bl_l, x1_bl_l:x2_bl_l] = blend_white_mask(packed_frame[y1_bl_l:y2_bl_l, x1_bl_l:x2_bl_l], q_tr_mask)
+        packed_frame[y1_bl_l:y2_bl_l, x1_bl_l:x2_bl_l] = blend_white_mask(packed_frame[y1_bl_l:y2_bl_l, x1_bl_l:x2_bl_l], q_tr_mask, q_tr_circle)
         return packed_frame
 
 class AlphaPackerB:
@@ -167,8 +213,8 @@ class AlphaPackerB:
         r = np.sqrt((grid_x - cx)**2 + (grid_y - cy)**2)
 
         max_r = min(w, h) / 2.0
-        outer_r = max_r * 0.55  # Fade fully to black here
-        inner_r = max_r * 0.45  # Solid white up to here
+        outer_r = max_r * 0.55  
+        inner_r = max_r * 0.45  
         
         t = np.clip((outer_r - r) / (outer_r - inner_r), 0.0, 1.0) 
         cache = t * t * (3.0 - 2.0 * t)
@@ -220,10 +266,8 @@ class AlphaPackerB:
         
         x1_center = half_W - w_half
         x2_center = x1_center + target_w
-        packed_frame[y1:y2, x1_center:x2_center] = blend_white_mask(
-            packed_frame[y1:y2, x1_center:x2_center], mask_l_circle, inv_circle_3d)
-        
-        # 2. Outer Peripheral Mask (Right mask split to the far left and right edges)
+        packed_frame[y1:y2, x1_center:x2_center] = blend_white_mask(packed_frame[y1:y2, x1_center:x2_center], mask_l_circle, inv_circle_3d)
+
         left_half_mask = mask_r_circle[:, :w_half]
         right_half_mask = mask_r_circle[:, w_half:]
         inv_circle_left = inv_circle_3d[:, :w_half]
@@ -232,14 +276,13 @@ class AlphaPackerB:
         
         packed_frame[y1:y2, 0:w_remain] = blend_white_mask(
             packed_frame[y1:y2, 0:w_remain], right_half_mask, inv_circle_right)
-        
-        # Left half goes to the far right edge of the SBS
+
         packed_frame[y1:y2, SBS_W - w_half:SBS_W] = blend_white_mask(
             packed_frame[y1:y2, SBS_W - w_half:SBS_W], left_half_mask, inv_circle_left)
 
         return packed_frame
 
-def process_fromes(video_frames, frames_pil, prompt, frame_index=0, object_id=1, start_frame_index=0, max_frames_to_track=-1, close_after_propagation=True,  keep_model_loaded=False, session_id=None, prior_mask=None, positive_coords=None, negative_coords=None, bbox=None, propagation_direction="forward", sam31=False, warp=False, prior_frame=None):
+def process_frames(video_frames, frames_pil, prompt, frame_index=0, object_id=1, start_frame_index=0, max_frames_to_track=-1, close_after_propagation=True,  keep_model_loaded=False, session_id=None, prior_mask=None, positive_coords=None, negative_coords=None, bbox=None, propagation_direction="forward", sam31=False, warp=False, prior_frame=None):
     
     raft = raft_flow(device="cuda") if warp else None
 
@@ -262,7 +305,7 @@ def process_fromes(video_frames, frames_pil, prompt, frame_index=0, object_id=1,
     geo_encoder_use_img_cross_attn=False,
     strict_state_dict_loading=False,
     async_loading_frames=True,
-    video_loader_type="ffmpeg",
+    video_loader_type="torchcodec",
     apply_temporal_disambiguation = True,
     compile = False)
 
@@ -273,7 +316,6 @@ def process_fromes(video_frames, frames_pil, prompt, frame_index=0, object_id=1,
         logger.info(f"Frame index {frame_index} is out of bounds, setting to last frame {chunk - 1}")
         frame_index = chunk - 1
 
-    # frames_pil = tensor2pil(video_frames)
     response = predictor.handle_request(
         request=dict(
             type="start_session",
@@ -290,7 +332,7 @@ def process_fromes(video_frames, frames_pil, prompt, frame_index=0, object_id=1,
         predictor.handle_request(dict(
             type="add_new_mask",
             session_id=session_id,
-            frame_index=0,
+            frame_index=frame_index,
             obj_id=object_id,
             mask=prior_mask,
             ))
@@ -300,18 +342,22 @@ def process_fromes(video_frames, frames_pil, prompt, frame_index=0, object_id=1,
         neg_points, neg_count, neg_errors = parse_points(negative_coords, video_frames[0].shape)
         points = None
         point_labels = None
+        
         if pos_points is not None and neg_points is not None:
             points = pos_points + neg_points
             point_labels = [1] * pos_count + [0] * neg_count
+            
         elif pos_points is not None:
             points = pos_points
             point_labels = [1] * pos_count
+            
         elif neg_points is not None:
             points = neg_points
             point_labels = [0] * neg_count
 
         bounding_boxes = None
         bounding_box_labels = None
+        
         if bbox is not None:
             bbox_coords, bbox_count = parse_bbox(bbox, video_frames[0].shape)
             if bbox_coords is not None:
@@ -333,13 +379,13 @@ def process_fromes(video_frames, frames_pil, prompt, frame_index=0, object_id=1,
         )
 
         hard_masks = []
-        output_masks = np.zeros((chunk, H, W), dtype=np.uint8)
+        output = np.zeros((chunk, H, W), dtype=np.uint8)
         processed_frames = 0
         object_outputs = {
             "obj_ids":None,
             "obj_masks":[]
         }
-        object_masks_dict = {}
+        objects = {}
 
         session = predictor._get_session(session_id)
         for response in predictor.handle_stream_request(
@@ -440,29 +486,29 @@ def process_fromes(video_frames, frames_pil, prompt, frame_index=0, object_id=1,
                     logits = outputs["out_mask_logits"]
 
                     if logits.shape[0] > 0:
-                        logits_tensor = torch.from_numpy(logits) if isinstance(logits, np.ndarray) else logits
-                        prob = torch.sigmoid(logits_tensor)
+                        tensor = torch.from_numpy(logits) if isinstance(logits, np.ndarray) else logits
+                        prob = torch.sigmoid(tensor)
                         merged_prob = torch.max(prob, dim=0).values.cpu().numpy()
-                        merged_mask = (merged_prob * 255).astype(np.uint8)
+                        merged = (merged_prob * 255).astype(np.uint8)
                         
-                        object_masks_dict[frame_idx] = (logits > 0).astype(np.float32) if isinstance(logits, np.ndarray) else (logits > 0).cpu().numpy().astype(np.float32)
-                        output_masks[frame_idx] = merged_mask
-                        hard_masks.append(output_masks)
+                        objects[frame_idx] = (logits > 0).astype(np.float32) if isinstance(logits, np.ndarray) else (logits > 0).cpu().numpy().astype(np.float32)
+                        output[frame_idx] = merged
+                        hard_masks.append(output)
                     else:
-                        object_masks_dict[frame_idx] = np.zeros((1, H, W), dtype=np.float32)
+                        objects[frame_idx] = np.zeros((1, H, W), dtype=np.float32)
                 
                 elif "out_binary_masks" in outputs:
                     mask = outputs["out_binary_masks"]
                     
                     if mask.shape[0] > 0:
-                        object_masks_dict[frame_idx] = mask
-                        merged_mask = (np.any(mask, axis=0) * 255).astype(np.uint8)
-                        output_masks[frame_idx] = merged_mask
-                        hard_masks.append(output_masks)
+                        objects[frame_idx] = mask
+                        merged = (np.any(mask, axis=0) * 255).astype(np.uint8)
+                        output[frame_idx] = merged
+                        hard_masks.append(output)
                     else:
-                        object_masks_dict[frame_idx] = np.zeros((1, H, W), dtype=np.float32)
+                        objects[frame_idx] = np.zeros((1, H, W), dtype=np.float32)
                 else:
-                    object_masks_dict[frame_idx] = np.zeros((1, H, W), dtype=np.float32)
+                    objects[frame_idx] = np.zeros((1, H, W), dtype=np.float32)
                     
             processed_frames += 1
         if close_after_propagation:
@@ -476,41 +522,44 @@ def process_fromes(video_frames, frames_pil, prompt, frame_index=0, object_id=1,
         if not keep_model_loaded and close_after_propagation:
             predictor.shutdown()
 
-    if len(object_masks_dict) > 0:
-        max_num_objects = max(mask.shape[0] for mask in object_masks_dict.values())
+    if len(objects) > 0:
+        max_num_objects = max(mask.shape[0] for mask in objects.values())
 
-        ordered_mask = []
-        padded_masks = []
+        ordered = []
+        padded = []
 
         for frame_idx in range(C):
-            if frame_idx in object_masks_dict:
-                mask = object_masks_dict[frame_idx]  
+            if frame_idx in objects:
+                mask = objects[frame_idx]  
                 num_objects = mask.shape[0]
+                
                 if num_objects < max_num_objects:
                     padding = np.zeros((max_num_objects - num_objects, H, W), dtype=np.float32)
                     padded_mask = np.concatenate([mask, padding], axis=0)
-                    ordered_mask.append(padded_mask)
-                    padded_masks.append(torch.from_numpy(padded_mask))
+                    ordered.append(padded_mask)
+                    padded.append(torch.from_numpy(padded_mask))
                 else:
-                    ordered_mask.append(mask)
-                    padded_masks.append(torch.from_numpy(mask))
+                    ordered.append(mask)
+                    padded.append(torch.from_numpy(mask))
             else:
-                empty_mask = np.zeros((max_num_objects, H, W), dtype=np.float32)
-                ordered_mask.append(empty_mask)
-                padded_masks.append(torch.zeros((max_num_objects, H, W)))
+                empty = np.zeros((max_num_objects, H, W), dtype=np.float32)
+                ordered.append(empty)
+                padded.append(torch.zeros((max_num_objects, H, W)))
 
-        object_masks = torch.stack(padded_masks, dim=0)
-        object_outputs["obj_masks"] = ordered_mask
+        object_masks = torch.stack(padded, dim=0)
+        object_outputs["obj_masks"] = ordered
     else:
         object_masks = torch.zeros((C, H, W))
         object_outputs["obj_masks"] = []
+    return output, session_id, frame_idx
 
-    return output_masks, session_id, frame_idx
-
-def process_videos(video_path1, video_path2, out_path, mask_path, prompt_text=None, 
-    batch_size=None, matte_size=None, warp=False, full_sbs=False, alpha_pack=False, left_right=False, debug=None, bbox=None):  
+def process_videos(video_path1, video_path2, out_path, mask_path, prompt_text=None, batch_size=None, matte_size=None, warp=False, full_sbs=False, alpha_pack=False, left_right=False, debug=None, bbox=None, overlay=False):  
 
     frames_tot, keyframes, width, height, duration, fps = metadata(video_path1)
+    half_w = width if left_right else width // 2
+    if left_right or alpha_pack:
+        frames_tot2, keyframes2, width2, height2, duration2, fps2 = metadata(video_path2)
+        half_w2 = width2 // 2
 
     if left_right:
         left = video_frame_generator(video_path1, force_rate=0, frame_load_cap=debug or 0, skip_first_frames=0, select_every_nth=1, output_format="bgr24")
@@ -527,11 +576,10 @@ def process_videos(video_path1, video_path2, out_path, mask_path, prompt_text=No
         _ = next(sbs) 
 
     out_width = width * 2 if left_right else width
-    half_w = width if left_right else width // 2
 
-    writer = ffmpeg_pipe(out_path, out_width, height, fps) if out_path else None
+    writer = ffmpeg_pipe(out_path, out_width, height, fps, audio_source=video_path1) if out_path else None
     mask_writer = ffmpeg_pipe(mask_path, out_width, height, fps) if mask_path else None
-    packer = AlphaPacker(scale=matte_size)
+    packer = AlphaPacker(scale=matte_size, circle=False)
 
     frame_count = 0
     frames_tot = frames_tot if debug is None else debug
@@ -560,11 +608,13 @@ def process_videos(video_path1, video_path2, out_path, mask_path, prompt_text=No
                     bgr_r = next(right)
                     r_frames.append(bgr_r)
                     frames.append(np.concatenate((bgr_l, bgr_r), axis=1))
+                
                 elif alpha_pack:        
                     frame_bgr = next(sbs)
                     frames.append(frame_bgr)        
                     matte_bgr = next(matte)
                     mattes.append(matte_bgr)                      
+               
                 else:
                     frame_bgr = next(sbs)
                     frames.append(frame_bgr)
@@ -579,7 +629,7 @@ def process_videos(video_path1, video_path2, out_path, mask_path, prompt_text=No
         if full_sbs:
             prior_mask = last_l if (last_l is not None and np.sum(last_l) > 0) else None
             pil_frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in  frames]       
-            masks, session_id, frame_idx = process_fromes(frames, pil_frames, prompt_text, prior_mask=prior_mask, frame_index=frame_idx_l, prior_frame=prior_frame)
+            masks, session_id, frame_idx = process_frames(frames, pil_frames, prompt_text, prior_mask=prior_mask, frame_index=frame_idx_l, prior_frame=prior_frame)
             
             last_l = masks[-1] if masks is not None else None
             session_l = session_id[-1] if session_id is not None else None
@@ -593,21 +643,21 @@ def process_videos(video_path1, video_path2, out_path, mask_path, prompt_text=No
             masks_l = [f[:, :half_w] for f in masks]
 
         elif alpha_pack:
-            masks_l = [cv2.cvtColor(f[:, :half_w], cv2.COLOR_BGR2GRAY) for f in mattes]
-            masks_r = [cv2.cvtColor(f[:, half_w:], cv2.COLOR_BGR2GRAY) for f in mattes]
+            masks_l = [cv2.cvtColor(f[:, :half_w2], cv2.COLOR_BGR2GRAY) for f in mattes]
+            masks_r = [cv2.cvtColor(f[:, half_w2:], cv2.COLOR_BGR2GRAY) for f in mattes]
 
         else:
             frames_l = l_frames if left_right else [f[:, :half_w] for f in frames]
             prior_l = last_l if (last_l is not None and np.sum(last_l) > 0) else None
             pil_l = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_l]       
-            masks_l, session_id, frame_idx_l = process_fromes(frames_l, pil_l, prompt_text)
+            masks_l, session_id, frame_idx_l = process_frames(frames_l, pil_l, prompt_text)
             masks_l = process_mask(masks_l, sensitivity=1.0, mask_blur=0, mask_offset=0, smooth=0, 
                             fill_holes=False, invert_output=False, dilation=5, feather_radius=0, smooth_edges=0, davinci=True)
 
             frames_r = r_frames if left_right else [f[:, half_w:] for f in frames]
             prior_r = last_r if (last_r is not None and np.sum(last_r) > 0) else None
             pil_r = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_r]
-            masks_r, session_id, frame_idx_r = process_fromes(frames_r, pil_r, prompt_text)
+            masks_r, session_id, frame_idx_r = process_frames(frames_r, pil_r, prompt_text)
             masks_r = process_mask(masks_r, sensitivity=1.0, mask_blur=0, mask_offset=0, smooth=0, 
                             fill_holes=False, invert_output=False, dilation=5, feather_radius=0, smooth_edges=0, davinci=True)
 
@@ -615,32 +665,51 @@ def process_videos(video_path1, video_path2, out_path, mask_path, prompt_text=No
             last_r = masks_r[-1] if masks_r is not None else None
 
         for i in range(chunk):
-
             if full_sbs:
                 packed_frame = packer.pack_frame(frames[i], masks_l[i], masks_r[i])
-                writer.stdin.write(packed_frame.astype(np.uint8).tobytes())         
-                full_sbs_img = resize_mask(torch.from_numpy(masks[i]).unsqueeze(0).unsqueeze(0), (height, out_width)).squeeze().numpy().astype(np.uint8)
-                mask_3d = np.zeros_like(frames[i])
-                mask_3d[:, :, 1] = full_sbs_img  # Green channel
-                sbs_out = cv2.addWeighted(frames[i], 0.6, mask_3d, 0.6, 0)           
-                mask_writer.stdin.write(sbs_out.tobytes())
+                if writer: writer.stdin.write(packed_frame.astype(np.uint8).tobytes())        
+                
+                if mask_writer:
+                    if overlay:
+                        full_sbs_img = resize_mask(torch.from_numpy(masks[i]).unsqueeze(0).unsqueeze(0), (height, out_width)).squeeze().numpy().astype(np.uint8)
+                        mask_3d = np.zeros_like(frames[i])
+                        mask_3d[:, :, 1] = full_sbs_img  # Green channel
+                        sbs_out = cv2.addWeighted(frames[i], 0.6, mask_3d, 0.6, 0)           
+                        mask_writer.stdin.write(sbs_out.tobytes())
+                    else:
+                        full_mask_l = cv2.resize(masks_l[i], (half_w, height), interpolation=cv2.INTER_LINEAR)
+                        full_mask_r = cv2.resize(masks_r[i], (half_w, height), interpolation=cv2.INTER_LINEAR)
+                        gray_sbs = np.zeros((height, out_width), dtype=np.uint8)
+                        gray_sbs[:, :half_w] = full_mask_l
+                        gray_sbs[:, half_w:] = full_mask_r
+                        mask_writer.stdin.write(gray_sbs.tobytes())
          
             elif alpha_pack:
                 packed_frame = packer.pack_frame(frames[i], masks_l[i], masks_r[i])
-                writer.stdin.write(packed_frame.astype(np.uint8).tobytes())
+                if writer: writer.stdin.write(packed_frame.astype(np.uint8).tobytes())
             
             else:
                 packed_frame = packer.pack_frame(frames[i], masks_l[i], masks_r[i])
-                writer.stdin.write(packed_frame.astype(np.uint8).tobytes())
-                full_mask_l = resize_mask(torch.from_numpy(masks_l[i]).unsqueeze(0).unsqueeze(0), (height, half_w)).squeeze().numpy().astype(np.uint8)
-                full_mask_r = resize_mask(torch.from_numpy(masks_r[i]).unsqueeze(0).unsqueeze(0), (height, half_w)).squeeze().numpy().astype(np.uint8)
-                gray_sbs = np.zeros((height, out_width), dtype=np.uint8)
-                gray_sbs[:, :half_w] = full_mask_l
-                gray_sbs[:, half_w:] = full_mask_r
-                mask_3d = np.zeros_like(frames[i])
-                mask_3d[:, :, 1] = gray_sbs  
-                sbs_out = cv2.addWeighted(frames[i], 0.3, mask_3d, 0.6, 0)          
-                mask_writer.stdin.write(sbs_out.tobytes())
+                if writer: writer.stdin.write(packed_frame.astype(np.uint8).tobytes())
+                
+                if mask_writer:
+                    if overlay:
+                        full_mask_l = resize_mask(torch.from_numpy(masks_l[i]).unsqueeze(0).unsqueeze(0), (height, half_w)).squeeze().numpy().astype(np.uint8)
+                        full_mask_r = resize_mask(torch.from_numpy(masks_r[i]).unsqueeze(0).unsqueeze(0), (height, half_w)).squeeze().numpy().astype(np.uint8)
+                        gray_sbs = np.zeros((height, out_width), dtype=np.uint8)
+                        gray_sbs[:, :half_w] = full_mask_l
+                        gray_sbs[:, half_w:] = full_mask_r
+                        mask_3d = np.zeros_like(frames[i])
+                        mask_3d[:, :, 1] = gray_sbs  
+                        sbs_out = cv2.addWeighted(frames[i], 0.3, mask_3d, 0.6, 0)          
+                        mask_writer.stdin.write(sbs_out.tobytes())
+                    else:
+                        full_mask_l = cv2.resize(masks_l[i], (half_w, height), interpolation=cv2.INTER_LINEAR)
+                        full_mask_r = cv2.resize(masks_r[i], (half_w, height), interpolation=cv2.INTER_LINEAR)
+                        gray_sbs = np.zeros((height, out_width), dtype=np.uint8)
+                        gray_sbs[:, :half_w] = full_mask_l
+                        gray_sbs[:, half_w:] = full_mask_r
+                        mask_writer.stdin.write(gray_sbs.tobytes())
 
         frame_count += chunk
         pbar.update(chunk)
@@ -717,7 +786,7 @@ if __name__ == "__main__":
         video_path2=video_path2,
         output_dir=OUTPUT_FOLDER,        
         prompt_text="One girl",
-        batch_size=0,
+        batch_size=100,
         matte_size=0.4,
         warp=False,
         full_sbs=False,
