@@ -1593,3 +1593,31 @@ class raft_flow:
         grid = torch.stack((x_norm, y_norm), dim=-1).unsqueeze(0)
         grid = grid.expand(N, -1, -1, -1) if have(N) else grid
         return torch.nn.functional.grid_sample(a, grid, mode=mode, padding_mode='border', align_corners=True) if have(N) else torch.nn.functional.grid_sample(a.unsqueeze(0), grid, mode=mode, padding_mode='border', align_corners=True).squeeze(0)
+
+def metadata(path):
+    cmd_key = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'frame=pict_type', '-of', 'csv=p=0', '-skip_frame', 'nokey', path]
+    res_key = subprocess.run(cmd_key, capture_output=True, text=True)
+    lines = res_key.stdout.strip().split('\n')
+    keyframes = len(lines)
+    cmd_stream = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', '-select_streams', 'v:0', path]
+    res_stream = subprocess.run(cmd_stream, capture_output=True, text=True)
+    data = json.loads(res_stream.stdout)
+
+    if not data.get('streams'):
+        return None, None, None, None, None, None
+        
+    stream = data['streams'][0]
+    width = int(stream['width'])
+    height = int(stream['height'])
+    duration = float(stream.get('duration', 0))
+    fps_str = stream.get('r_frame_rate', '30/1')
+    num, denom = map(int, fps_str.split('/'))
+    fps = num / denom if denom != 0 else 30.0
+    f_tot = stream.get('nb_frames')
+
+    if f_tot:
+        frames = int(f_tot)
+    else:
+        frames = int(duration * fps) if duration > 0 else 0
+        
+    return frames, keyframes, width, height, duration, fps
