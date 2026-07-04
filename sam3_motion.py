@@ -1,60 +1,8 @@
-import logging, os, glob, json
-from tqdm import tqdm
 from imagemask import *
-# from sam3.model_builder import build_sam3_predictor
-from model_builder import build_sam3_video_predictor
+from model_builder import build_sam3_video_predictor, build_sam3_predictor
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
-logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
-
-def _setup_tf32() -> None:
-    if torch.cuda.is_available():
-        device_props = torch.cuda.get_device_properties(0)
-        if device_props.major >= 8:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-
-_setup_tf32()
-
-def have(a):
-    return a is not None  
-
-def aorb(a, b):
-    return a if have(a) else b
-
-def aborc(a, b, c):
-    return aorb(a, aorb(b, c))
-
-def abcord(a, b, c, d):
-    return aorb(a, aborc(b, c, d))
-
-def metadata(path):
-    cmd_key = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'frame=pict_type', '-of', 'csv=p=0', '-skip_frame', 'nokey', path]
-    res_key = subprocess.run(cmd_key, capture_output=True, text=True)
-    lines = res_key.stdout.strip().split('\n')
-    keyframes = len(lines)
-    cmd_stream = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', '-select_streams', 'v:0', path]
-    res_stream = subprocess.run(cmd_stream, capture_output=True, text=True)
-    data = json.loads(res_stream.stdout)
-
-    if not data.get('streams'):
-        return None, None, None, None, None, None
-        
-    stream = data['streams'][0]
-    width = int(stream['width'])
-    height = int(stream['height'])
-    duration = float(stream.get('duration', 0))
-    fps_str = stream.get('r_frame_rate', '30/1')
-    num, denom = map(int, fps_str.split('/'))
-    fps = num / denom if denom != 0 else 30.0
-    f_tot = stream.get('nb_frames')
-
-    if f_tot:
-        frames = int(f_tot)
-    else:
-        frames = int(duration * fps) if duration > 0 else 0
-        
-    return frames, keyframes, width, height, duration, fps
 
 def ffmpeg_pipe(out_path, width, height, fps, audio_source=None):
 
@@ -286,18 +234,18 @@ def process_frames(video_frames, frames_pil, prompt_text, frame_index=0, object_
     
     raft = raft_flow(device="cuda") if warp else None
 
-    # predictor =  build_sam3_predictor(
-    # checkpoint_path = None,
-    # bpe_path = None,
-    # version= "sam3.1",
-    # compile= False,
-    # warm_up= False,
-    # max_num_objects = 2,
-    # multiplex_count = 16,   
-    # use_fa3 = False,
-    # use_rope_real = False,
-    # async_loading_frames = True,
-    # default_output_prob_thresh=0.55) if sam31 else None
+    predictor =  build_sam3_predictor(
+    checkpoint_path = None,
+    bpe_path = None,
+    version= "sam3.1",
+    compile= False,
+    warm_up= False,
+    max_num_objects = 2,
+    multiplex_count = 16,   
+    use_fa3 = False,
+    use_rope_real = False,
+    async_loading_frames = True,
+    default_output_prob_thresh=0.55) if sam31 else None
 
     predictor = build_sam3_video_predictor(
     gpus_to_use=None,
@@ -711,6 +659,7 @@ def process_videos(video_path1, video_path2, out_path, mask_path, prompt_text=No
         
 def process_directory(video_path1, video_path2, output_dir, **kwargs):
     os.makedirs(output_dir, exist_ok=True)
+    import glob
 
     video_files = []
     for ext in ["*.mov", "*.mp4", "*.mkv", "*.avi"]: 
