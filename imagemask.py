@@ -20,7 +20,7 @@ def abcord(a, b, c, d):
 
 def np2tensor(img_np: np.ndarray | list[np.ndarray]) -> torch.Tensor:
     if isinstance(img_np, list):
-        return torch.cat([np2tensor(img) for img in img_np], dim=0)
+        return torch.cat([np2tensor(image) for image in img_np], dim=0)
 
     return torch.from_numpy(img_np.astype(np.float32) / 255.0).unsqueeze(0)
 
@@ -211,7 +211,7 @@ def tensor2pil(image):
         return image
         
     if isinstance(image, list):
-        return [tensor2pil(img) for img in image]
+        return [tensor2pil(image) for image in image]
         
     if isinstance(image, torch.Tensor):
         img_np = image.detach().cpu().numpy()
@@ -245,17 +245,17 @@ def tensor2pil(image):
     img_np = np.clip(img_np, 0, 255).astype(np.uint8)
     
     pil_images = []
-    for img in img_np:
-        channels = img.shape[-1]
+    for image in img_np:
+        channels = image.shape[-1]
         if channels == 1:
-            pil_img = Image.fromarray(img.squeeze(-1), mode='L')
+            pil = Image.fromarray(image.squeeze(-1), mode='L')
         elif channels == 3:
-            pil_img = Image.fromarray(img, mode='RGB')
+            pil = Image.fromarray(image, mode='RGB')
         elif channels == 4:
-            pil_img = Image.fromarray(img, mode='RGBA')
+            pil = Image.fromarray(image, mode='RGBA')
         else:
             raise ValueError(f"Unsupported channel count: {channels}")
-        pil_images.append(pil_img)
+        pil_images.append(pil)
         
     if is_batched:
         return pil_images
@@ -267,7 +267,7 @@ def pil2tensor(image):
         return None
         
     if isinstance(image, list):
-        tensors = [pil2tensor(img) for img in image if img is not None]
+        tensors = [pil2tensor(image) for image in image if image is not None]
         if not tensors:
             return None
         return torch.cat(tensors, dim=0)
@@ -301,8 +301,8 @@ def pil2tensor(image):
 
 image_to_tensor = pil2tensor
 
-def resize_image(img: Image.Image, width: int, height: int) -> Image.Image:
-    return img.resize((width, height), resample=Image.LANCZOS)
+def resize_image(image: Image.Image, width: int, height: int) -> Image.Image:
+    return image.resize((width, height), resample=Image.LANCZOS)
 
 def get_target_dimensions(orig_width, orig_height, custom_width=0, custom_height=0, megapixels=0.0, scale_by=1.0, size=0, resize_mode="longest_side", downscale_ratio=0):
     target_w, target_h = orig_width, orig_height
@@ -369,14 +369,14 @@ def _resize_image(image, megapixels=0.0, scale_by=1.0, size=0, resize_mode="long
 def target_dimensions(orig_width, orig_height, megapixels=0.0, scale_by=1.0, size=0, resize_mode="longest_side"):
     return get_target_dimensions(orig_width, orig_height, megapixels=megapixels, scale_by=scale_by, size=size, resize_mode=resize_mode)
 
-def resize_image(img, mask_channel="alpha", resampling=Image.LANCZOS, megapixels=0.0, scale_by=1.0, size=0, resize_mode="longest_side", advanced_mask=False):
+def resize_image(image, mask_channel="alpha", resampling=Image.LANCZOS, megapixels=0.0, scale_by=1.0, size=0, resize_mode="longest_side", advanced_mask=False):
 
-    resized_img, width, height = _resize_image(img, megapixels=megapixels, scale_by=scale_by, size=size, resize_mode=resize_mode, resampling=resampling)
-    img_rgb = resized_img.convert("RGB")
+    resized, width, height = _resize_image(image, megapixels=megapixels, scale_by=scale_by, size=size, resize_mode=resize_mode, resampling=resampling)
+    img_rgb = resized.convert("RGB")
     mask = None
     if advanced_mask:
-        if mask_channel == "alpha" and "A" in resized_img.getbands():
-            mask = np.array(resized_img.getchannel("A")).astype(np.float32) / 255.0
+        if mask_channel == "alpha" and "A" in resized.getbands():
+            mask = np.array(resized.getchannel("A")).astype(np.float32) / 255.0
         elif mask_channel == "red":
             mask = np.array(img_rgb.getchannel("R")).astype(np.float32) / 255.0
         elif mask_channel == "green":
@@ -384,13 +384,13 @@ def resize_image(img, mask_channel="alpha", resampling=Image.LANCZOS, megapixels
         elif mask_channel == "blue":
             mask = np.array(img_rgb.getchannel("B")).astype(np.float32) / 255.0
     else:
-        if "A" in resized_img.getbands():
-            mask = np.array(resized_img.getchannel("A")).astype(np.float32) / 255.0
+        if "A" in resized.getbands():
+            mask = np.array(resized.getchannel("A")).astype(np.float32) / 255.0
 
     if mask is None:
         mask = np.ones((height, width), dtype=np.float32)
 
-    image_tensor = image_to_tensor(img_rgb)
+    tensor = image_to_tensor(img_rgb)
     mask_tensor = torch.from_numpy(mask).unsqueeze(0)
 
     if advanced_mask:
@@ -398,7 +398,7 @@ def resize_image(img, mask_channel="alpha", resampling=Image.LANCZOS, megapixels
     else:
         mask_image = None
 
-    return image_tensor, mask_tensor, mask_image, width, height
+    return tensor, mask_tensor, mask_image, width, height
 
 def target_size(width, height, custom_width, custom_height, downscale_ratio=8) -> tuple[int, int]:
     if downscale_ratio is None:
@@ -467,8 +467,8 @@ def denormalize_and_resize(tensor, target_w, target_h):
     img_float = (tensor.float() * 0.5 + 0.5) * 255.0
     if img_float.shape[2] != target_w or img_float.shape[1] != target_h:
         img_float = torch.nn.functional.interpolate(img_float.unsqueeze(0), size=(target_h, target_w), mode="bicubic", align_corners=False).squeeze(0)
-    img = img_float.permute(1, 2, 0).to(torch.uint8)
-    return img
+    image = img_float.permute(1, 2, 0).to(torch.uint8)
+    return image
 
 def join_image_with_alpha(image: torch.Tensor, alpha: torch.Tensor, invert=False):
     batch_size = min(image.shape[0], alpha.shape[0])
@@ -580,7 +580,7 @@ def video_frame_generator(video, force_rate=0, frame_load_cap=0, skip_first_fram
             seek_pts = int(start_time / vstream.time_base)
             container.seek(seek_pts, stream=vstream)
             
-        frames_yielded = 0
+        yielded = 0
         frame_idx = -1
         current_time = 0.0
         
@@ -608,8 +608,8 @@ def video_frame_generator(video, force_rate=0, frame_load_cap=0, skip_first_fram
             if inp is not None:
                 return
             
-            frames_yielded += 1
-            if frame_load_cap > 0 and frames_yielded >= frame_load_cap:
+            yielded += 1
+            if frame_load_cap > 0 and yielded >= frame_load_cap:
                 break
                 
     finally:
@@ -721,13 +721,13 @@ def common_upscale(samples, width, height, upscale_method, crop):
         out = out.reshape((orig_shape[0], -1, orig_shape[1]) + (height, width))
         return out.movedim(2, 1).reshape(orig_shape[:-2] + (height, width))
 
-def bytesio_to_image_tensor(image_bytesio: BytesIO, mode: str = "RGBA") -> torch.Tensor:
+def bytes_to_tensor(image_bytesio: BytesIO, mode: str = "RGBA") -> torch.Tensor:
     image = Image.open(image_bytesio)
     image = image.convert(mode)
     image_array = np.array(image).astype(np.float32) / 255.0
     return torch.from_numpy(image_array).unsqueeze(0)
 
-def image_tensor_pair_to_batch(image1: torch.Tensor, image2: torch.Tensor) -> torch.Tensor:
+def pair_to_batch(image1: torch.Tensor, image2: torch.Tensor) -> torch.Tensor:
 
     if image1.shape[1:] != image2.shape[1:]:
         image2 = common_upscale(
@@ -746,21 +746,21 @@ def tensor_to_pil(image: torch.Tensor, total_pixels: int | None = 2048 * 2048) -
     input_tensor = image.cpu()
     
     if total_pixels is not None:
-        input_tensor = downscale_image_tensor(input_tensor.unsqueeze(0), total_pixels=total_pixels).squeeze()
+        input_tensor = downscale_tensor(input_tensor.unsqueeze(0), total_pixels=total_pixels).squeeze()
     
     image_np = (input_tensor.numpy() * 255).astype(np.uint8)
-    img = Image.fromarray(image_np)
-    return img
+    image = Image.fromarray(image_np)
+    return image
 
-def tensor_to_base64_string(image_tensor: torch.Tensor, total_pixels: int | None = 2048 * 2048, mime_type: str = "image/png") -> str:
+def tensor_to_base64(tensor: torch.Tensor, total_pixels: int | None = 2048 * 2048, mime_type: str = "image/png") -> str:
 
-    pil_image = tensor_to_pil(image_tensor, total_pixels)
+    pil_image = tensor_to_pil(tensor, total_pixels)
     img_byte_arr = pil_to_bytesio(pil_image, mime_type=mime_type)
     img_bytes = img_byte_arr.getvalue()
     base64_encoded_string = base64.b64encode(img_bytes).decode("utf-8")
     return base64_encoded_string
 
-def pil_to_bytesio(img: Image.Image, mime_type: str = "image/png") -> BytesIO:
+def pil_to_bytesio(image: Image.Image, mime_type: str = "image/png") -> BytesIO:
 
     if not mime_type:
         mime_type = "image/png"
@@ -771,11 +771,11 @@ def pil_to_bytesio(img: Image.Image, mime_type: str = "image/png") -> BytesIO:
     if pil_format == "JPG":
         pil_format = "JPEG"
    
-    img.save(img_byte_arr, format=pil_format)
+    image.save(img_byte_arr, format=pil_format)
     img_byte_arr.seek(0)
     return img_byte_arr
 
-def _compute_downscale_dims(src_w: int, src_h: int, total_pixels: int) -> tuple[int, int] | None:
+def _downscale_dims(src_w: int, src_h: int, total_pixels: int) -> tuple[int, int] | None:
 
     pixels = src_w * src_h
     if pixels <= total_pixels:
@@ -788,9 +788,9 @@ def _compute_downscale_dims(src_w: int, src_h: int, total_pixels: int) -> tuple[
     new_h -= new_h % 2
     return new_w, new_h
 
-def downscale_image_tensor(image: torch.Tensor, total_pixels: int = 1536 * 1024) -> torch.Tensor:
+def downscale_tensor(image: torch.Tensor, total_pixels: int = 1536 * 1024) -> torch.Tensor:
     samples = image.movedim(-1, 1)
-    dims = _compute_downscale_dims(samples.shape[3], samples.shape[2], int(total_pixels))
+    dims = _downscale_dims(samples.shape[3], samples.shape[2], int(total_pixels))
 
     if dims is None:
         return image
@@ -798,7 +798,7 @@ def downscale_image_tensor(image: torch.Tensor, total_pixels: int = 1536 * 1024)
     new_w, new_h = dims
     return common_upscale(samples, new_w, new_h, "lanczos", "disabled").movedim(1, -1)
 
-def downscale_image_tensor_by_max_side(image: torch.Tensor, *, max_side: int) -> torch.Tensor:
+def tensor_max_side(image: torch.Tensor, *, max_side: int) -> torch.Tensor:
 
     samples = image.movedim(-1, 1)
     height, width = samples.shape[2], samples.shape[3]
@@ -814,19 +814,19 @@ def downscale_image_tensor_by_max_side(image: torch.Tensor, *, max_side: int) ->
     s = s.movedim(1, -1)
     return s
 
-def tensor_to_data_uri(image_tensor: torch.Tensor, total_pixels: int | None = 2048 * 2048, mime_type: str = "image/png") -> str:
-    base64_string = tensor_to_base64_string(image_tensor, total_pixels, mime_type)
+def tensor_to_data_uri(tensor: torch.Tensor, total_pixels: int | None = 2048 * 2048, mime_type: str = "image/png") -> str:
+    base64_string = tensor_to_base64(tensor, total_pixels, mime_type)
     return f"data:{mime_type};base64,{base64_string}"
 
 def downscale_video_to_max_pixels(video, max_pixels: int):
 
     src_w, src_h = video.get_dimensions()
-    scale_dims = _compute_downscale_dims(src_w, src_h, max_pixels)
+    scale_dims = _downscale_dims(src_w, src_h, max_pixels)
     if scale_dims is None:
         return video
     return _apply_video_scale(video, scale_dims)
 
-def _compute_upscale_dims(src_w: int, src_h: int, total_pixels: int) -> tuple[int, int] | None:
+def _upscale_dims(src_w: int, src_h: int, total_pixels: int) -> tuple[int, int] | None:
     pixels = src_w * src_h
     if pixels >= total_pixels:
         return None
@@ -841,10 +841,10 @@ def _compute_upscale_dims(src_w: int, src_h: int, total_pixels: int) -> tuple[in
         new_h += 1
     return new_w, new_h
 
-def upscale_video_to_min_pixels(video, min_pixels: int):
+def to_min_pixels(video, min_pixels: int):
 
     src_w, src_h = video.get_dimensions()
-    scale_dims = _compute_upscale_dims(src_w, src_h, min_pixels)
+    scale_dims = _upscale_dims(src_w, src_h, min_pixels)
 
     if scale_dims is None:
         return video
@@ -920,7 +920,7 @@ def repeat_to_batch_size(tensor, batch_size, dim=0):
         return tensor.repeat(dim * [1] + [math.ceil(batch_size / tensor.shape[dim])] + [1] * (len(tensor.shape) - 1 - dim)).narrow(dim, 0, batch_size)
     return tensor
 
-def resize_to_batch_size(tensor, batch_size):
+def resize_to_batch(tensor, batch_size):
     in_batch_size = tensor.shape[0]
     if in_batch_size == batch_size:
         return tensor
@@ -940,7 +940,7 @@ def resize_to_batch_size(tensor, batch_size):
 
     return output
 
-def resize_list_to_batch_size(l, batch_size):
+def resize_list_to_batch(l, batch_size):
     in_batch_size = len(l)
     if in_batch_size == batch_size or in_batch_size == 0:
         return l
@@ -960,11 +960,11 @@ def resize_list_to_batch_size(l, batch_size):
 
     return output
 
-def convert_mask_to_image(mask: torch.Tensor) -> torch.Tensor:
+def mask_to_image(mask: torch.Tensor) -> torch.Tensor:
     mask = mask.unsqueeze(-1)
     return torch.cat([mask] * 3, dim=-1)
 
-def load_resource_as_video_frames(
+def load_resource(
     resource_path, image_size, offload_video_to_cpu, img_mean=(0.5, 0.5, 0.5), img_std=(0.5, 0.5, 0.5),
     async_loading_frames=False, video_loader_type="cv2", start_frame=0, max_frames=None
 ):
@@ -1079,7 +1079,7 @@ class TorchCodecVideoLoader:
         
         meta = core.get_container_metadata(self.decoder)
         stream = meta.streams[meta.best_vstream_index]
-        self.num_frames = stream.num_frames_from_content
+        self.num_frames = stream.num_from_content
         self.video_height = stream.height
         self.video_width = stream.width
         
@@ -1391,24 +1391,24 @@ def expand_mask(self, mask, expand, tapered_corners, flip_input, blur_radius, in
     else:
         return (torch.stack(out, dim=0), 1.0 - torch.stack(out, dim=0),)
     
-def remap(img, flow, border_mode = cv2.BORDER_REFLECT_101):
+def remap(image, flow, border_mode = cv2.BORDER_REFLECT_101):
     if border_mode == cv2.BORDER_WRAP:
         border_mode = cv2.BORDER_REFLECT_101
-    h, w = img.shape[:2]
+    h, w = image.shape[:2]
     displacement = int(h * 0.25), int(w * 0.25)
-    larger_img = cv2.copyMakeBorder(img, displacement[0], displacement[0], displacement[1], displacement[1], border_mode)
-    lh, lw = larger_img.shape[:2]
+    larger = cv2.copyMakeBorder(image, displacement[0], displacement[0], displacement[1], displacement[1], border_mode)
+    lh, lw = larger.shape[:2]
     larger_flow = extend_flow(flow, lw, lh)
-    remapped_img = cv2.remap(larger_img, larger_flow, None, cv2.INTER_LINEAR, border_mode)
-    output_img = center_crop_image(remapped_img, w, h)
-    return output_img
+    remapped = cv2.remap(larger, larger_flow, None, cv2.INTER_LINEAR, border_mode)
+    output = center_crop_image(remapped, w, h)
+    return output
 
-def center_crop_image(img, w, h):
-    y, x, _ = img.shape
+def center_crop_image(image, w, h):
+    y, x, _ = image.shape
     width_indent = int((x - w) / 2)
     height_indent = int((y - h) / 2)
-    cropped_img = img[height_indent:y-height_indent, width_indent:x-width_indent]
-    return cropped_img
+    cropped = image[height_indent:y-height_indent, width_indent:x-width_indent]
+    return cropped
 
 def extend_flow(flow, w, h):
     flow_h, flow_w = flow.shape[:2]
@@ -1474,22 +1474,22 @@ def get_flow_from_images_Farneback(i1, i2, preset="normal", last_flow=None, pyr_
     flow = cv2.calcOpticalFlowFarneback(i1, i2, last_flow, pyr_scale, levels, winsize, iterations, poly_n, poly_sigma, flags)
     return flow
 
-def image_transform_optical_flow(img, flow, border_mode=cv2.BORDER_REPLICATE, flow_reverse=False):
+def optical_flow(image, flow, border_mode=cv2.BORDER_REPLICATE, flow_reverse=False):
     if not flow_reverse:
         flow = -flow
-    h, w = img.shape[:2]
+    h, w = image.shape[:2]
     flow[:, :, 0] += np.arange(w)
     flow[:, :, 1] += np.arange(h)[:,np.newaxis]
-    return remap(img, flow, border_mode)
+    return remap(image, flow, border_mode)
 
-def draw_flow_lines_in_grid_in_color(img, flow, step=8, magnitude_multiplier=1, min_magnitude = 0, max_magnitude = 10000):
+def draw_flow_lines(image, flow, step=8, magnitude_multiplier=1, min_magnitude = 0, max_magnitude = 10000):
     flow = flow * magnitude_multiplier
-    h, w = img.shape[:2]
+    h, w = image.shape[:2]
     y, x = np.mgrid[step/2:h:step, step/2:w:step].reshape(2,-1).astype(int)
     fx, fy = flow[y,x].T
     lines = np.vstack([x, y, x+fx, y+fy]).T.reshape(-1, 2, 2)
     lines = np.int32(lines + 0.5)
-    vis = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    vis = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
 
     mag, ang = cv2.cartToPolar(flow[...,0], flow[...,1])
@@ -1511,81 +1511,6 @@ def draw_flow_lines_in_grid_in_color(img, flow, step=8, magnitude_multiplier=1, 
             cv2.arrowedLine(vis, (x1, y1), (x2, y2), color, thickness=1, tipLength=0.1)    
     return vis
 
-def visualize_flow(flow_img, flow):
-    flow_img = cv2.cvtColor(flow_img, cv2.COLOR_RGB2GRAY)
-    flow_img = cv2.cvtColor(flow_img, cv2.COLOR_GRAY2BGR)
-    flow_img = draw_flow_lines_in_grid_in_color(flow_img, flow)
-    return cv2.cvtColor(flow_img, cv2.COLOR_BGR2RGB)
-
-class ComputeOpticalFlow:
-    def __init__(self):
-        pass
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prev": ("IMAGE",),
-                "current": ("IMAGE",),
-                "method": ([
-                    "DIS Medium",
-                    "DIS Fine",
-                    "Farneback",
-                ],),
-            },
-        }
-
-    RETURN_TYPES = ("OPTICAL_FLOW",)
-    FUNCTION = "compute_flow"
-    CATEGORY = "Optical flow"
-
-    def compute_flow(self, prev, current, method):
-        images = zip(tensor2np(prev), tensor2np(current))
-        return ([get_flow_from_images(im1, im2, method) for im1, im2 in images],)
-
-class ApplyOpticalFlow:
-    def __init__(self):
-        pass
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "image": ("IMAGE",),
-                "flow": ("OPTICAL_FLOW",),
-            },
-        }
-
-    RETURN_TYPES = ("IMAGE",)
-    FUNCTION = "apply_flow"
-    CATEGORY = "Optical flow"
-
-    def apply_flow(self, image, flow):
-        ims = tensor2np(image)
-        out = [image_transform_optical_flow(im, f) for im, f in zip(ims, flow)]
-        return (np2tensor(out),)
-
-class VisualizeOpticalFlow:
-    """Visualize a flow as a set of arrows superimposed on the original image."""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "image": ("IMAGE",),
-                "flow": ("OPTICAL_FLOW",),
-            },
-        }
-
-    RETURN_TYPES = ("IMAGE",)
-    FUNCTION = "visualize_flow"
-    CATEGORY = "Optical flow"
-
-    def visualize_flow(self, image, flow):
-        ifs = zip(tensor2np(image), flow)
-        out = [visualize_flow(img, flow) for img, flow in ifs]
-        return (np2tensor(out),)
-
 def propagate_in_video(predictor, session_id):
     outputs_per_frame = {}
     for response in predictor.handle_stream_request(
@@ -1593,7 +1518,7 @@ def propagate_in_video(predictor, session_id):
         outputs_per_frame[response["frame_index"]] = response["outputs"]
     return outputs_per_frame
 
-def abs_to_rel_coords(coords, IMG_WIDTH, IMG_HEIGHT, coord_type="point"):
+def rel_coords(coords, IMG_WIDTH, IMG_HEIGHT, coord_type="point"):
     if coord_type == "point":
         return [[x / IMG_WIDTH, y / IMG_HEIGHT] for x, y in coords]
     elif coord_type == "box":
