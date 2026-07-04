@@ -139,21 +139,18 @@ def davinci_resolve_smooth(mask: torch.Tensor, glow_radius: float = 3.0, glow_de
     if x.ndim == 2: x = x[None, None, ...]
     elif x.ndim == 3: x = x[None, ...]
     
-    # 1. Blur the black background and cut it out of the white mask (Eats peninsulas)
     if bg_blur_radius > 0:
         bg = 1.0 - x
         k_size_bg = int(bg_blur_radius * 2) + 1
         blurred_bg = torchvision.transforms.functional.gaussian_blur(bg, kernel_size=k_size_bg, sigma=float(bg_blur_radius))
         x = torch.clamp(x - blurred_bg, 0.0, 1.0)
         
-    # 2. Dense thin glow (Fills bays)
     if glow_radius > 0:
         k_size_glow = int(glow_radius * 2) + 1
         blurred_x = torchvision.transforms.functional.gaussian_blur(x, kernel_size=k_size_glow, sigma=float(glow_radius))
         dense_glow = torch.clamp(blurred_x * glow_density, 0.0, 1.0)
         x = torch.maximum(x, dense_glow)
         
-    # 3. "Dilate that back a tiny bit" (Erode to shrink the expanded glow)
     if shrink > 0:
         k_size_shrink = int(shrink * 2) + 1
         pad = int(shrink)
@@ -619,13 +616,6 @@ def video_frame_generator(video, force_rate=0, frame_load_cap=0, skip_first_fram
         if 'container' in locals():
             container.close()
             
-    if 'meta_batch' in kwargs and kwargs.get('meta_batch') is not None:
-        unique_id = kwargs.get('unique_id')
-        meta_batch = kwargs['meta_batch']
-        if unique_id in meta_batch.inputs:
-            meta_batch.inputs.pop(unique_id)
-        meta_batch.has_closed_inputs = True
-
 def bislerp(samples, width, height):
     def slerp(b1, b2, r):
         c = b1.shape[-1]
@@ -902,7 +892,7 @@ def _apply_video_scale(video, scale_dims: tuple[int, int]):
     output_container.close()
     input_container.close()
     output_buffer.seek(0)
-    return torch.Tensor.VideoFromFile(output_buffer)
+    return torch.Tensor.VideoFromFile(output_buffer) # check if this is correct
 
 def text_filepath_to_base64_string(filepath: str) -> str:
     with open(filepath, "rb") as f:
