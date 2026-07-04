@@ -1,8 +1,8 @@
 import logging, os, glob, json
 from tqdm import tqdm
 from imagemask import *
-from sam3.model_builder import build_sam3_predictor
-from model_builder2 import build_sam3_video_predictor
+# from sam3.model_builder import build_sam3_predictor
+from model_builder import build_sam3_video_predictor
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -286,18 +286,18 @@ def process_frames(video_frames, frames_pil, prompt_text, frame_index=0, object_
     
     raft = raft_flow(device="cuda") if warp else None
 
-    predictor =  build_sam3_predictor(
-    checkpoint_path = None,
-    bpe_path = None,
-    version= "sam3.1",
-    compile= False,
-    warm_up= False,
-    max_num_objects = 2,
-    multiplex_count = 16,   
-    use_fa3 = False,
-    use_rope_real = False,
-    async_loading_frames = True,
-    default_output_prob_thresh=0.55) if sam31 else None
+    # predictor =  build_sam3_predictor(
+    # checkpoint_path = None,
+    # bpe_path = None,
+    # version= "sam3.1",
+    # compile= False,
+    # warm_up= False,
+    # max_num_objects = 2,
+    # multiplex_count = 16,   
+    # use_fa3 = False,
+    # use_rope_real = False,
+    # async_loading_frames = True,
+    # default_output_prob_thresh=0.55) if sam31 else None
 
     predictor = build_sam3_video_predictor(
     gpus_to_use=None,
@@ -548,7 +548,7 @@ def process_frames(video_frames, frames_pil, prompt_text, frame_index=0, object_
         object_outputs["obj_masks"] = []
     return output, session_id, frame_idx
 
-def process_videos(video_path1, video_path2, out_path, mask_path, prompt_text=None, batch_size=None, matte_size=None, warp=False, full_sbs=False, alpha_pack=False, left_right=False, debug=None, bbox=None, overlay=True):  
+def process_videos(video_path1, video_path2, out_path, mask_path, prompt_text=None, batch_size=None, matte_size=None, warp=False, full_sbs=False, alpha_pack=False, left_right=False, debug=None, bbox=None, overlay=False):  
 
     standard = not aborc(full_sbs,alpha_pack, left_right)
     frames_tot, keyframes, width, height, duration, fps = metadata(video_path1)
@@ -713,7 +713,7 @@ def process_directory(video_path1, video_path2, output_dir, **kwargs):
     os.makedirs(output_dir, exist_ok=True)
 
     video_files = []
-    for ext in ["*.mp4", "*.mkv", "*.mov", "*.avi"]: 
+    for ext in ["*.mov", "*.mp4", "*.mkv", "*.avi"]: 
         video_files.extend(glob.glob(os.path.join(video_path1, ext)))
     
     if not video_files:
