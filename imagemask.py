@@ -555,14 +555,14 @@ def run_process(cmd, log_callback, process_callback=None):
 def video_frame_generator(video, force_rate=0, frame_load_cap=0, skip_first_frames=0, select_every_nth=1, start_time=0.0, output_format="tensor", **kwargs):
     try:
         container = av.open(video)
-        video_stream = container.streams.video[0]
-        video_stream.thread_type = "AUTO"
+        vstream = container.streams.video[0]
+        vstream.thread_type = "AUTO"
         
-        fps = float(video_stream.average_rate) if video_stream.average_rate else 30.0
-        width = video_stream.width
-        height = video_stream.height
-        duration = float(video_stream.duration * video_stream.time_base) if video_stream.duration else 0.0
-        total_frames = video_stream.frames if video_stream.frames > 0 else int(duration * fps)
+        fps = float(vstream.average_rate) if vstream.average_rate else 30.0
+        width = vstream.width
+        height = vstream.height
+        duration = float(vstream.duration * vstream.time_base) if vstream.duration else 0.0
+        total_frames = vstream.frames if vstream.frames > 0 else int(duration * fps)
         
         target_fps = force_rate if force_rate > 0 else fps
         target_frame_time = 1.0 / target_fps
@@ -577,14 +577,14 @@ def video_frame_generator(video, force_rate=0, frame_load_cap=0, skip_first_fram
         yield (width, height, fps, duration, total_frames, target_frame_time, yieldable_frames)
         
         if start_time > 0:
-            seek_pts = int(start_time / video_stream.time_base)
-            container.seek(seek_pts, stream=video_stream)
+            seek_pts = int(start_time / vstream.time_base)
+            container.seek(seek_pts, stream=vstream)
             
         frames_yielded = 0
         frame_idx = -1
         current_time = 0.0
         
-        for frame in container.decode(video_stream):
+        for frame in container.decode(vstream):
             frame_idx += 1
             if frame_idx < skip_first_frames:
                 continue
@@ -593,7 +593,7 @@ def video_frame_generator(video, force_rate=0, frame_load_cap=0, skip_first_fram
                 continue
                 
             if force_rate > 0:
-                frame_time_sec = float(frame.pts * video_stream.time_base) if frame.pts else frame_idx / fps
+                frame_time_sec = float(frame.pts * vstream.time_base) if frame.pts else frame_idx / fps
                 if frame_time_sec < current_time:
                     continue
                 current_time += target_frame_time
@@ -854,45 +854,45 @@ def _apply_video_scale(video, scale_dims: tuple[int, int]):
 
     out_w, out_h = scale_dims
     output_buffer = BytesIO()
-    input_container = None
-    output_container = None
+    input = None
+    output = None
 
     input_source = video.get_stream_source()
-    input_container = av.open(input_source, mode="r")
-    output_container = av.open(output_buffer, mode="w", format="mp4")
+    input = av.open(input_source, mode="r")
+    output = av.open(output_buffer, mode="w", format="mp4")
 
-    video_stream = output_container.add_stream("h264", rate=video.get_frame_rate())
-    video_stream.width = out_w
-    video_stream.height = out_h
-    video_stream.pix_fmt = "yuv420p"
+    vstream = output.add_stream("h264", rate=video.get_frame_rate())
+    vstream.width = out_w
+    vstream.height = out_h
+    vstream.pix_fmt = "yuv420p"
 
-    audio_stream = None
-    for stream in input_container.streams:
+    astream = None
+    for stream in input.streams:
         if isinstance(stream, av.AudioStream):
-            audio_stream = output_container.add_stream("aac", rate=stream.sample_rate)
-            audio_stream.sample_rate = stream.sample_rate
-            audio_stream.layout = stream.layout
+            astream = output.add_stream("aac", rate=stream.sample_rate)
+            astream.sample_rate = stream.sample_rate
+            astream.layout = stream.layout
             break
 
-    for frame in input_container.decode(video=0):
+    for frame in input.decode(video=0):
         frame = frame.reformat(width=out_w, height=out_h, format="yuv420p")
-        for packet in video_stream.encode(frame):
-            output_container.mux(packet)
-    for packet in video_stream.encode():
-        output_container.mux(packet)
+        for packet in vstream.encode(frame):
+            output.mux(packet)
+    for packet in vstream.encode():
+        output.mux(packet)
 
-    if audio_stream is not None:
-        input_container.seek(0)
-        for audio_frame in input_container.decode(audio=0):
-            for packet in audio_stream.encode(audio_frame):
-                output_container.mux(packet)
-        for packet in audio_stream.encode():
-            output_container.mux(packet)
+    if astream is not None:
+        input.seek(0)
+        for audio_frame in input.decode(audio=0):
+            for packet in astream.encode(audio_frame):
+                output.mux(packet)
+        for packet in astream.encode():
+            output.mux(packet)
 
-    output_container.close()
-    input_container.close()
+    output.close()
+    input.close()
     output_buffer.seek(0)
-    return torch.Tensor.VideoFromFile(output_buffer) # check if this is correct
+    return torch.Tensor.VideoFromFile(output_buffer)
 
 def text_filepath_to_base64_string(filepath: str) -> str:
     with open(filepath, "rb") as f:
@@ -1072,13 +1072,13 @@ class TorchCodecVideoLoader:
         
         self.decoder = core.create_from_file(video_path, "exact")
         core.scan_all_streams_to_update_metadata(self.decoder)
-        core.add_video_stream(
+        core.add_vstream(
             self.decoder, dimension_order="NCHW", device=str(decode_device), 
             num_threads=1 if decode_device.type == "cuda" else 4
         )
         
         meta = core.get_container_metadata(self.decoder)
-        stream = meta.streams[meta.best_video_stream_index]
+        stream = meta.streams[meta.best_vstream_index]
         self.num_frames = stream.num_frames_from_content
         self.video_height = stream.height
         self.video_width = stream.width
@@ -1360,7 +1360,7 @@ def expand_mask(self, mask, expand, tapered_corners, flip_input, blur_radius, in
                 else:
                     output = morph.dilation(output, kernel)
         
-        output = output.squeeze(0).squeeze(0)  # Remove batch and channel dims
+        output = output.squeeze(0).squeeze(0)
         
         if current_expand < 0:
             current_expand -= abs(incremental_expandrate)
@@ -1382,13 +1382,9 @@ def expand_mask(self, mask, expand, tapered_corners, flip_input, blur_radius, in
         out.append(output.cpu())
 
     if blur_radius != 0:
-        # Convert the tensor list to PIL images, apply blur, and convert back
         for idx, tensor in enumerate(out):
-            # Convert tensor to PIL image
             pil_image = tensor2pil(tensor.cpu().detach())[0]
-            # Apply Gaussian blur
             pil_image = pil_image.filter(ImageFilter.GaussianBlur(blur_radius))
-            # Convert back to tensor
             out[idx] = pil2tensor(pil_image)
         blurred = torch.cat(out, dim=0)
         return (blurred, 1.0 - blurred)
@@ -1396,7 +1392,6 @@ def expand_mask(self, mask, expand, tapered_corners, flip_input, blur_radius, in
         return (torch.stack(out, dim=0), 1.0 - torch.stack(out, dim=0),)
     
 def remap(img, flow, border_mode = cv2.BORDER_REFLECT_101):
-    # copyMakeBorder doesn't support wrap, but supports replicate. Replaces wrap with reflect101.
     if border_mode == cv2.BORDER_WRAP:
         border_mode = cv2.BORDER_REFLECT_101
     h, w = img.shape[:2]
@@ -1416,21 +1411,14 @@ def center_crop_image(img, w, h):
     return cropped_img
 
 def extend_flow(flow, w, h):
-    # Get the shape of the original flow image
     flow_h, flow_w = flow.shape[:2]
-    # Calculate the position of the image in the new image
     x_offset = int((w - flow_w) / 2)
     y_offset = int((h - flow_h) / 2)
-    # Generate the X and Y grids
     x_grid, y_grid = np.meshgrid(np.arange(w), np.arange(h))
-    # Create the new flow image and set it to the X and Y grids
     new_flow = np.dstack((x_grid, y_grid)).astype(np.float32)
-    # Shift the values of the original flow by the size of the border
     flow[:,:,0] += x_offset
     flow[:,:,1] += y_offset
-    # Overwrite the middle of the grid with the original flow
     new_flow[y_offset:y_offset+flow_h, x_offset:x_offset+flow_w, :] = flow
-    # Return the extended image
     return new_flow
 
 def get_flow_from_images(i1, i2, method, prev_flow=None):
@@ -1438,17 +1426,14 @@ def get_flow_from_images(i1, i2, method, prev_flow=None):
         flow = get_flow_from_images_DIS(i1, i2, 'medium', prev_flow)
     elif method == "DIS Fine":
         flow = get_flow_from_images_DIS(i1, i2, 'fine', prev_flow)
-    elif method == "Farneback": # Farneback Normal:
+    elif method == "Farneback":
         flow = get_flow_from_images_Farneback(i1, i2, prev_flow)
     else:
-        # if we reached this point, something went wrong. raise an error:
         raise RuntimeError(f"Invald flow method name: '{method}'")
 
     return flow
 
 def get_flow_from_images_DIS(i1, i2, preset, prev_flow):
-    # DIS PRESETS CHART KEY: finest scale, grad desc its, patch size
-    # DIS_MEDIUM: 1, 25, 8 | DIS_FAST: 2, 16, 8 | DIS_ULTRAFAST: 2, 12, 8
     if preset == 'medium': preset_code = cv2.DISOPTICAL_FLOW_PRESET_MEDIUM    
     elif preset == 'fast': preset_code = cv2.DISOPTICAL_FLOW_PRESET_FAST    
     elif preset == 'ultrafast': preset_code = cv2.DISOPTICAL_FLOW_PRESET_ULTRAFAST   
@@ -1456,7 +1441,6 @@ def get_flow_from_images_DIS(i1, i2, preset, prev_flow):
     i1 = cv2.cvtColor(i1, cv2.COLOR_BGR2GRAY)
     i2 = cv2.cvtColor(i2, cv2.COLOR_BGR2GRAY)
     dis = cv2.DISOpticalFlow_create(preset_code)
-    # custom presets
     if preset == 'slow':
         dis.setGradientDescentIterations(192)
         dis.setFinestScale(1)
@@ -1470,23 +1454,23 @@ def get_flow_from_images_DIS(i1, i2, preset, prev_flow):
     return dis.calc(i1, i2, prev_flow)
 
 def get_flow_from_images_Farneback(i1, i2, preset="normal", last_flow=None, pyr_scale = 0.5, levels = 3, winsize = 15, iterations = 3, poly_n = 5, poly_sigma = 1.2, flags = 0):
-    flags = cv2.OPTFLOW_FARNEBACK_GAUSSIAN         # Specify the operation flags
-    pyr_scale = 0.5   # The image scale (<1) to build pyramids for each image
+    flags = cv2.OPTFLOW_FARNEBACK_GAUSSIAN
+    pyr_scale = 0.5
     if preset == "fine":
-        levels = 13       # The number of pyramid layers, including the initial image
-        winsize = 77      # The averaging window size
-        iterations = 13   # The number of iterations at each pyramid level
-        poly_n = 15       # The size of the pixel neighborhood used to find polynomial expansion in each pixel
-        poly_sigma = 0.8  # The standard deviation of the Gaussian used to smooth derivatives used as a basis for the polynomial expansion
-    else: # "normal"
-        levels = 5        # The number of pyramid layers, including the initial image
-        winsize = 21      # The averaging window size
-        iterations = 5    # The number of iterations at each pyramid level
-        poly_n = 7        # The size of the pixel neighborhood used to find polynomial expansion in each pixel
-        poly_sigma = 1.2  # The standard deviation of the Gaussian used to smooth derivatives used as a basis for the polynomial expansion
+        levels = 13
+        winsize = 77
+        iterations = 13
+        poly_n = 15
+        poly_sigma = 0.8
+    else:
+        levels = 5
+        winsize = 21
+        iterations = 5
+        poly_n = 7
+        poly_sigma = 1.2
     i1 = cv2.cvtColor(i1, cv2.COLOR_BGR2GRAY)
     i2 = cv2.cvtColor(i2, cv2.COLOR_BGR2GRAY)
-    flags = 0 # flags = cv2.OPTFLOW_USE_INITIAL_FLOW    
+    flags = 0
     flow = cv2.calcOpticalFlowFarneback(i1, i2, last_flow, pyr_scale, levels, winsize, iterations, poly_n, poly_sigma, flags)
     return flow
 
@@ -1516,12 +1500,9 @@ def draw_flow_lines_in_grid_in_color(img, flow, step=8, magnitude_multiplier=1, 
     bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
     vis = cv2.add(vis, bgr)
 
-    # Iterate through the lines
     for (x1, y1), (x2, y2) in lines:
-        # Calculate the magnitude of the line
         magnitude = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
 
-        # Only draw the line if it falls within the magnitude range
         if min_magnitude <= magnitude <= max_magnitude:
             b = int(bgr[y1, x1, 0])
             g = int(bgr[y1, x1, 1])
@@ -1624,7 +1605,7 @@ class raft_flow:
     def __init__(self, device, max_size=1008, flow_scale=1.0, interp_mode="bicubic"):
 
         try:
-            from torchvision.models.optical_flow import raft_small, Raft_Small_Weights # from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
+            from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
             HAS_RAFT = True
         except ImportError:
             HAS_RAFT = False
