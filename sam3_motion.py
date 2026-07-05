@@ -143,7 +143,7 @@ class AlphaPacker:
         packed_frame[y1_bl_l:y2_bl_l, x1_bl_l:x2_bl_l] = blend_white_mask(packed_frame[y1_bl_l:y2_bl_l, x1_bl_l:x2_bl_l], q_tr_mask, q_tr_circle)
         return packed_frame
 
-class AlphaPackerB:
+class otherAlphaPacker:
     def __init__(n, scale=0.25, padding=0):
 
         n.scale = scale
@@ -500,7 +500,7 @@ def process_frames(frames, frames_pil, prompt_text, frame_index=0, object_id=1, 
 
     return output, session_id, frame_idx, object_masks, object_outputs
 
-def process_videos(video_path1, video_path2, out_path, mask_path, prompt_text=None, batch_size=None, matte_size=None, warp=False, full_sbs=False, alpha_pack=False, left_right=False, debug=None, bbox=None, overlay=False, track_prev=False):  
+def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_text=None, batch_size=None, matte_size=None, warp=False, full_sbs=False, alpha_pack=False, left_right=False, debug=None, bbox=None, overlay=False, track_prev=False):  
 
     standard = not aborc(full_sbs, alpha_pack, left_right)
     frames_tot, keyframes, width, height, duration, fps = metadata(video_path1)
@@ -699,7 +699,7 @@ def process_directory(video_path1, video_path2, output_dir, **kwargs):
             print(f"Skipping {filename}, outputs already exist.")
             continue            
 
-        process_videos(
+        process_allthethings(
             video_path1=v_path1,
             video_path2=v_path2,
             out_path=out_path,
