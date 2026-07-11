@@ -211,7 +211,7 @@ class otherAlphaPacker:
         H, SBS_W, C = frames.shape
         half_W = SBS_W // 2
 
-        if mask_l.dtype != np.uint8:
+        if mask_l.dtype != np.uint8: # hate numpy too
             mask_l = (mask_l * 255).astype(np.uint8)
             mask_r = (mask_r * 255).astype(np.uint8)
 
@@ -553,7 +553,7 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
         geo_encoder_use_img_cross_attn = False,
         strict_state_dict_loading = False,
         async_loading_frames = True,
-        video_loader_type = "cv2",
+        video_loader_type = "cv2", # hate cv2 but transfering back and forth is a bottle neck.. do what you gotta do.
         apply_temporal_disambiguation = True,
         compile = False
     ) if not sam31 else None
