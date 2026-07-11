@@ -3,12 +3,17 @@ from huggingface_hub import hf_hub_download
 # import pkg_resources
 from torch import set_default_dtype
 from imagemask import *
-from model_builder import build_sam3_multiplex_video_predictor, build_sam3_video_predictor
+from sam3.model.sam3_video_predictor import Sam3VideoPredictorMultiGPU
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
 set_default_dtype(dtype)
 gpus_to_use = [torch.cuda.current_device()]
+
+def build_sam3_video_predictor(*model_args, checkpoint_path=None, bpe_path=None, gpus_to_use=None, **model_kwargs):
+    return Sam3VideoPredictorMultiGPU(
+        *model_args, gpus_to_use=gpus_to_use, **model_kwargs
+    )
 
 def download_ckpt_from_hf(version="sam3"):
     if version == "sam3.1":
@@ -34,8 +39,8 @@ def download_ckpt_from_hf(version="sam3"):
     else:
         raise ValueError(f"Unsupported version: {version}")
 
-    _ = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CFG_NAME, force_download=False, local_files_only=True)
-    checkpoint_path = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CKPT_NAME, force_download=False, local_files_only=True)
+    _ = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CFG_NAME, force_download=True, local_files_only=False)
+    checkpoint_path = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CKPT_NAME, force_download=True, local_files_only=False)
     return checkpoint_path
 
 def ffmpeg_pipe(out_path, width, height, fps, audio_source=None):
@@ -49,7 +54,6 @@ def ffmpeg_pipe(out_path, width, height, fps, audio_source=None):
         ffmpeg_cmd.extend(['-i', audio_source, '-map', '0:v', '-map', '1:a?'])
         
     ffmpeg_cmd.extend([
-        # '-filter_complex', 'tvai_up=model=iris-3:scale=0:w=iw:h=ih:preblur=0:noise=0:details=0:halo=0:blur=0:compression=0:estimate=8:device=-2:vram=0.8:instances=1', 
         '-sws_flags', 'lanczos+full_chroma_int+accurate_rnd+full_chroma_inp', '-c:v', 'hevc_qsv', '-profile:v', 'main10', '-pix_fmt', 'p010le', '-tag:v', 'hvc1', '-g', '100', '-b:v', '100M', '-preset', 'medium', '-aspect', '2:1', '-copyts', '-start_at_zero', '-bitexact', '-c:a', 'aac', '-b:a', '256k', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-fps_mode', 'cfr', '-r', str(fps), '-movflags', '+faststart+write_colr+use_metadata_tags', '-metadata:s:v:0', 'stereo_mode=left_right', '-color_trc', 'bt709', out_path
     ])
     return subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -342,6 +346,7 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
 
         if bbox is not None:
             bbox_coords, bbox_count = parse_bbox(bbox, frames[0].shape)
+
             if bbox_coords is not None:
                 bounding_boxes = bbox_coords
                 bounding_box_labels = [1] * bbox_count
@@ -545,6 +550,9 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
     raft = raft_flow(device="cuda") if warp else None
 
     predictor = build_sam3_video_predictor(
+        checkpoint_path = download_ckpt_from_hf(version="sam3"),
+        # checkpoint_path = "assets/sam3.pt",
+        bpe_path = "assets/bpe_simple_vocab_16e6.txt.gz",
         gpus_to_use = None,
         has_presence_token = False,
         geo_encoder_use_img_cross_attn = False,
