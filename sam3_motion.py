@@ -1,9 +1,7 @@
 
 from huggingface_hub import hf_hub_download
-# import pkg_resources
 from torch import set_default_dtype
 from masksandthings import *
-from sam3.model.sam3_video_predictor import Sam3VideoPredictorMultiGPU
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
@@ -11,12 +9,11 @@ set_default_dtype(dtype)
 gpus_to_use = [torch.cuda.current_device()]
 
 def build_sam3_video_predictor(*model_args, checkpoint_path=None, bpe_path=None, gpus_to_use=None, **model_kwargs):
-    return Sam3VideoPredictorMultiGPU(
-        *model_args, gpus_to_use=gpus_to_use, **model_kwargs
-    )
+    from sam3.model.sam3_video_predictor import Sam3VideoPredictorMultiGPU
+    predictor = Sam3VideoPredictorMultiGPU(*model_args, gpus_to_use=gpus_to_use, **model_kwargs)
+    return predictor
 
 def download_ckpt_from_hf(version="sam3"):
-
     if version == "sam3.1":
         repo_id = "facebook/sam3.1"
         ckpt_name = "sam3.1_multiplex.pt"
@@ -36,9 +33,9 @@ def download_ckpt_from_hf(version="sam3"):
         ckpt_name = "sam3.pt"
         cfg_name = "config.json"
 
-            #if you dont have the model force_download=True local_files_only=False and enter a token for hf.. the fp16s are fine. sam3 is good. they kind of messed 3.1 up.
-    _ = hf_hub_download(repo_id=repo_id, filename=cfg_name, force_download=False, local_files_only=False, token="")
-    checkpoint_path = hf_hub_download(repo_id=repo_id, filename=ckpt_name, force_download=False, local_files_only=False, token="")
+            #if you dont have the model force_download=True local_files_only=False and enter a token for hf.. the fp16s are a little wonky. Start with sam3
+    _ = hf_hub_download(repo_id=repo_id, filename=cfg_name, force_download=False, local_files_only=False) #, token=""
+    checkpoint_path = hf_hub_download(repo_id=repo_id, filename=ckpt_name, force_download=False, local_files_only=False) # , token=""
     return checkpoint_path
 
 def ffmpeg_pipe(out_path, width, height, fps, audio_source=None):
@@ -211,7 +208,7 @@ class otherAlphaPacker:
         H, SBS_W, C = frames.shape
         half_W = SBS_W // 2
 
-        if mask_l.dtype != np.uint8: # hate numpy too
+        if mask_l.dtype != np.uint8:
             mask_l = (mask_l * 255).astype(np.uint8)
             mask_r = (mask_r * 255).astype(np.uint8)
 
@@ -268,6 +265,7 @@ class otherAlphaPacker:
         return p_frame
 
 def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_idx=0, object_id=1, start_frame_idx=0, max_frames_to_track=-1, close_after_propagation=True, keep_model_loaded=True, session_id=None, prev_mask=None, positive_coords=None, negative_coords=None, bbox=None, propagation_direction="forward", sam31=False, warp=None, prev_frame=None, matte_size=None, prev_flow=None, max_size=1008):
+    # count += 1
 
     frames = [cv2.resize(f, (max_size, max_size), interpolation=cv2.INTER_LANCZOS4) for f in frames] if max_size is not None else frames
     frames_pil = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames] 
@@ -546,38 +544,39 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
 
     raft = raft_flow(device="cuda") if warp else None
 
-    predictor = build_sam3_video_predictor(
-        checkpoint_path = download_ckpt_from_hf(version="sam3_fp16"),
-        gpus_to_use = None,
-        has_presence_token = False,
-        geo_encoder_use_img_cross_attn = False,
-        strict_state_dict_loading = False,
-        async_loading_frames = True,
-        video_loader_type = "cv2", # hate cv2 but transfering back and forth is a bottle neck.. do what you gotta do.
-        apply_temporal_disambiguation = True,
-        compile = False
-    ) if not sam31 else None
-    
-    predictor = build_sam3_multiplex_video_predictor(
-        checkpoint_path = download_ckpt_from_hf(version="sam3.1"),
-        max_num_objects = 1,
-        multiplex_count = 1,
-        use_fa3 = False,
-        use_rope_real = False,
-        compile = False,
-        warm_up = False,
-        session_expiration_sec = 5000,
-        default_output_prob_thresh = 0.5,
-        async_loading_frames = True,
-    ) if sam31 else predictor           
-     
+    if sam31:
+        from sam3.model_builder import build_sam3_multiplex_video_predictor
+        predictor = build_sam3_multiplex_video_predictor(
+            checkpoint_path = download_ckpt_from_hf(version="sam3.1"),
+            max_num_objects = 1,
+            multiplex_count = 1,
+            use_fa3 = False,
+            use_rope_real = False,
+            compile = False,
+            warm_up = False,
+            session_expiration_sec = 5000,
+            default_output_prob_thresh = 0.5,
+            async_loading_frames = True,
+        ) 
+    else:
+        predictor = build_sam3_video_predictor(
+            checkpoint_path = download_ckpt_from_hf(version="sam3"),
+            gpus_to_use = None,
+            has_presence_token = False,
+            geo_encoder_use_img_cross_attn = False,
+            strict_state_dict_loading = False,
+            async_loading_frames = True,
+            video_loader_type = "cv2",
+            apply_temporal_disambiguation = True,
+            compile = False
+        ) 
+                  
     frames_tot, keyframes, width, height, duration, fps = metadata(video_path1)
     half_w = width // 2
 
     if alpha_pack:
         frames_tot2, keyframes2, width2, height2, duration2, fps2 = metadata(video_path2)
         half_w2 = width2 // 2
-        #i wrote a better function will remove this hacky-ness
         sbs = video_frame_generator(video_path1, force_rate=0, frame_load_cap=debug or 0, skip_first_frames=0, select_every_nth=1, output_format="bgr24")
         _ = next(sbs)         
         matte = video_frame_generator(video_path2, force_rate=0, frame_load_cap=debug or 0, skip_first_frames=0, select_every_nth=1, output_format="bgr24")
@@ -598,6 +597,7 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
     frame_count = 0
     frames_tot = frames_tot if debug is None else debug
     batch_size = frames_tot if batch_size == 0 else batch_size
+
     pbar = tqdm(total=frames_tot, desc="Processing .. beep.boop.bop.. beep.")
 
     while frame_count < frames_tot:
@@ -605,7 +605,7 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
         mattes = []
       
         for _ in range(keyframes if batch_size is None else batch_size):
-            try: # There is no try only do. todo: nuke all try/except blocks
+            try:
                 if alpha_pack:        
                     frame_bgr = next(sbs)
                     frames.append(frame_bgr)        
@@ -625,7 +625,7 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
         print(f"Processing chunk of {chunk} frames, total processed: {frame_count}/{frames_tot}")
         max_track = frames_tot - frame_count
         
-        if full_sbs: # sam3 seems to be able to segment side by side as if it were a single image. You text prompt "one girl" and it will segment both left and right as if it see "one girl". Nothing special about the attention or rope..
+        if full_sbs:
             pil_frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in  frames]     
             masks = process_frames(predictor, frames, frames_pil=pil_frames, prompt_text=prompt_text, max_frames_to_track=max_track, frame_idx=frame_count, warp=raft)
             masks_r = [f[:, half_w:] for f in masks]
@@ -642,6 +642,7 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
         else:
             masks_l = process_frames(predictor, frames=[f[:, :half_w] for f in frames], prompt_text=prompt_text, max_frames_to_track=max_track, frame_idx=frame_count, warp=raft)
             masks_r = process_frames(predictor, frames=[f[:, half_w:] for f in frames], prompt_text=prompt_text, max_frames_to_track=max_track, frame_idx=frame_count, warp=raft)
+
             masks_l = process_mask(masks_l, sensitivity=1.0, mask_blur=0, mask_offset=-1, fill_holes=False, invert_output=False, dilation=2, feather_radius=2.0, smooth_edges=3, davinci=True)
             masks_r = process_mask(masks_r, sensitivity=1.0, mask_blur=0, mask_offset=-1, fill_holes=False, invert_output=False, dilation=2, feather_radius=2.0, smooth_edges=3, davinci=True)
             
@@ -733,6 +734,7 @@ def process_directory(video_path1, video_path2, output_dir, **kwargs):
             **kwargs)
 
 if __name__ == "__main__":
+
     INPUT_FOLDER = "assets/video_segments"
     INPUT_FOLDER2 = "assets/video_segments2"
     OUTPUT_FOLDER = "assets/out_segments"
@@ -752,12 +754,12 @@ if __name__ == "__main__":
         video_path2=video_path2,
         output_dir=OUTPUT_FOLDER,        
         prompt_text="One girl",
-        batch_size=5,
+        batch_size=100,
         matte_size=0.4,
         warp=False,
         full_sbs=False,
         alpha_pack=alpha_pack,
         left_right=left_right,
-        debug=5,
+        debug=None,
         bbox=None,
     )
