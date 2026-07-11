@@ -190,7 +190,7 @@ def process_mask(mask: torch.Tensor, sensitivity=1.0, mask_blur=0, mask_offset=0
         m = morph3x3.__wrapped__(m, actual_offset)
         
     if davinci:
-        m = davinci_resolve_smooth.__wrapped__(m, glow_radius=5.0, glow_density=4.5, bg_blur_radius=4.0, shrink=1)
+        m = davinci_resolve_smooth.__wrapped__(m, glow_radius=4.0, glow_density=2.5, bg_blur_radius=0.0, shrink=1)
 
     if smooth_edges > 0:
         m = mask_edges.__wrapped__(m, kernel_size=smooth_edges)
@@ -301,7 +301,7 @@ def pil2tensor(image):
 
 image_to_tensor = pil2tensor
 
-def resize_image(image: Image.Image, width: int, height: int) -> Image.Image:
+def image_resize(image: Image.Image, width: int, height: int) -> Image.Image:
     return image.resize((width, height), resample=Image.LANCZOS)
 
 def get_target_dimensions(orig_width, orig_height, custom_width=0, custom_height=0, megapixels=0.0, scale_by=1.0, size=0, resize_mode="longest_side", downscale_ratio=0):
@@ -426,12 +426,14 @@ def combine_masks(mask_1, mode="combine", mask_2=None, mask_3=None, mask_4=None)
         result = torch.abs(masks[0] - masks[1])
     return (torch.clamp(result, 0, 1),)
 
-def resize_mask(mask, target_shape):
+def resize_mask(mask, target_shape = None, target_height = None, target_width = None):
     if mask.shape == target_shape:
         return mask
-        
-    target_height = target_shape[-2] if len(target_shape) >= 2 else target_shape[0]
-    target_width = target_shape[-1] if len(target_shape) >= 2 else target_shape[1]
+    
+    if target_height is None:
+        target_height = target_shape[-2] if len(target_shape) >= 2 else target_shape[0]
+    if target_width is None:
+        target_width = target_shape[-1] if len(target_shape) >= 2 else target_shape[1]
     
     if mask.shape[-2] == target_height and mask.shape[-1] == target_width:
         return mask
@@ -616,6 +618,99 @@ def video_frame_generator(video, force_rate=0, frame_load_cap=0, skip_first_fram
         if 'container' in locals():
             container.close()
             
+class VideoFrameGenerator:
+    def __init__(
+        self,
+        video,
+        force_rate=0,
+        frame_load_cap=0,
+        skip_first_frames=0,
+        select_every_nth=1,
+        start_time=0.0,
+        output_format="tensor",
+    ):
+        self.container = av.open(video)
+        self.vstream = self.container.streams.video[0]
+        self.vstream.thread_type = "AUTO"
+
+        self.width = self.vstream.width
+        self.height = self.vstream.height
+        self.fps = float(self.vstream.average_rate) if self.vstream.average_rate else 30.0
+        self.duration = float(self.vstream.duration * self.vstream.time_base) if self.vstream.duration else 0.0
+        self.total_frames = self.vstream.frames if self.vstream.frames > 0 else int(self.duration * self.fps)
+
+        self.force_rate = force_rate
+        self.frame_load_cap = frame_load_cap
+        self.skip_first_frames = skip_first_frames
+        self.select_every_nth = select_every_nth
+        self.start_time = start_time
+        self.output_format = output_format
+
+        self.target_fps = force_rate if force_rate > 0 else self.fps
+        self.target_frame_time = 1.0 / self.target_fps
+        self.yieldable_frames = self.total_frames
+        if start_time > 0:
+            self.yieldable_frames -= int(start_time * self.fps)
+        if skip_first_frames > 0:
+            self.yieldable_frames -= skip_first_frames
+        if force_rate > 0:
+            self.yieldable_frames = int(self.yieldable_frames * (force_rate / self.fps))
+        if select_every_nth > 1:
+            self.yieldable_frames //= select_every_nth
+        if frame_load_cap > 0:
+            self.yieldable_frames = min(self.yieldable_frames, frame_load_cap)
+
+        self._decoder = None
+        self._frame_idx = -1
+        self._current_time = 0.0
+        self._yielded = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def __iter__(self):
+        if self._decoder is None:
+            if self.start_time > 0:
+                seek_pts = int(self.start_time / self.vstream.time_base)
+                self.container.seek(seek_pts, stream=self.vstream)
+            self._decoder = self.container.decode(self.vstream)
+        return self
+
+    def __next__(self):
+        while True:
+            frame = next(self._decoder)
+            self._frame_idx += 1
+
+            if self._frame_idx < self.skip_first_frames:
+                continue
+            if self._frame_idx % self.select_every_nth != 0:
+                continue
+
+            if self.force_rate > 0:
+                frame_time_sec = float(frame.pts * self.vstream.time_base) if frame.pts else self._frame_idx / self.fps
+                if frame_time_sec < self._current_time:
+                    continue
+                self._current_time += self.target_frame_time
+
+            if self.output_format == "bgr24":
+                out_frame = frame.to_ndarray(format="bgr24")
+            else:
+                img_np = frame.to_ndarray(format="rgb24")
+                out_frame = torch.from_numpy(img_np).float() / 255.0
+
+            self._yielded += 1
+            if self.frame_load_cap > 0 and self._yielded >= self.frame_load_cap:
+                self.close()
+            return out_frame
+
+    def close(self):
+        if self.container is not None:
+            self.container.close()
+            self.container = None
+
 def bislerp(samples, width, height):
     def slerp(b1, b2, r):
         c = b1.shape[-1]
