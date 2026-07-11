@@ -16,31 +16,29 @@ def build_sam3_video_predictor(*model_args, checkpoint_path=None, bpe_path=None,
     )
 
 def download_ckpt_from_hf(version="sam3"):
+
     if version == "sam3.1":
-        SAM3_MODEL_ID = "AEmotionStudio/sam3.1"
-        SAM3_CKPT_NAME = "sam3.1_multiplex.pt"
-        SAM3_CFG_NAME = "config.json"
+        repo_id = "facebook/sam3.1"
+        ckpt_name = "sam3.1_multiplex.pt"
+        cfg_name = "config.json"
 
     elif version == "sam3.1_fp16":
-        SAM3_MODEL_ID = "strangervisionhf/sam3.1-st-bf16"
-        SAM3_CKPT_NAME = "sam3.1_multiplex.pt"
-        SAM3_CFG_NAME = "config.json"
+        repo_id = "strangervisionhf/sam3.1-st-bf16"
+        ckpt_name = "sam3.1_multiplex.pt"
+        cfg_name = "config.json"
 
     elif version == "sam3_fp16":
-        SAM3_MODEL_ID = "mlx-community/sam3-bf16"
-        SAM3_CKPT_NAME = "model.safetensors"
-        SAM3_CFG_NAME = "config.json"
-
-    elif version == "sam3":
-        SAM3_MODEL_ID = "Translsis/sam3-model"
-        SAM3_CKPT_NAME = "sam3.pt"
-        SAM3_CFG_NAME = "config.json"
-    
+        repo_id = "mlx-community/sam3-bf16"
+        ckpt_name = "model.safetensors"
+        cfg_name = "config.json"
     else:
-        raise ValueError(f"Unsupported version: {version}")
+        repo_id = "facebook/sam3"
+        ckpt_name = "sam3.pt"
+        cfg_name = "config.json"
 
-    _ = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CFG_NAME, force_download=True, local_files_only=False)
-    checkpoint_path = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CKPT_NAME, force_download=True, local_files_only=False)
+            #if you dont have the model force_download=True local_files_only=False and enter a token for hf.. the fp16s are a little wonky. sam3 is good. they kind of messed 3.1 up.
+    _ = hf_hub_download(repo_id=repo_id, filename=cfg_name, force_download=False, local_files_only=False, token="")
+    checkpoint_path = hf_hub_download(repo_id=repo_id, filename=ckpt_name, force_download=False, local_files_only=False, token="")
     return checkpoint_path
 
 def ffmpeg_pipe(out_path, width, height, fps, audio_source=None):
@@ -269,7 +267,7 @@ class otherAlphaPacker:
 
         return p_frame
 
-def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_idx=0, object_id=1, start_frame_idx=0, max_frames_to_track=-1, close_after_propagation=True, keep_model_loaded=True, session_id=None, prev_mask=None, positive_coords=None, negative_coords=None, bbox=None, propagation_direction="forward", sam31=False, warp=False, prev_frame=None, matte_size=None, prev_flow=None, max_size=1008):
+def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_idx=0, object_id=1, start_frame_idx=0, max_frames_to_track=-1, close_after_propagation=True, keep_model_loaded=True, session_id=None, prev_mask=None, positive_coords=None, negative_coords=None, bbox=None, propagation_direction="forward", sam31=False, warp=None, prev_frame=None, matte_size=None, prev_flow=None, max_size=1008):
     # count += 1
 
     frames = [cv2.resize(f, (max_size, max_size), interpolation=cv2.INTER_LANCZOS4) for f in frames] if max_size is not None else frames
@@ -392,7 +390,7 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
             if obj_ids is not None:
                 object_outputs["obj_ids"] = obj_ids
 
-            if warp:
+            if warp is not None:
                 session = predictor._get_session(session_id)
                 inference_state = session["state"]
                 states = inference_state["tracker_inference_states"]
@@ -415,9 +413,9 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
                         curr_tensor = tensors_rgb[frame_idx]
                         # print(f'Frame index 3: {frame_idx}')
 
-                    if prev_frame is not None:
-                        flow = get_flow_from_images(frames_pil, prev_frame, method="DIS Medium", prev_flow=prev_flow)
-                        prev_flow = flow[-1] if flow is not None else None
+                    # if prev_frame is not None:
+                    #     flow = get_flow_from_images(frames_pil, prev_frame, method="DIS Medium", prev_flow=prev_flow)
+                    #     prev_flow = flow[-1] if flow is not None else None
 
                         predictor.model._prepare_backbone_feats(
                             inference_state=inference_state,
@@ -427,7 +425,7 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
                         _, _, h_mask, w_mask = prev_logits.shape
                         _, _, frame_H, frame_W = prev_tensor.unsqueeze(0).shape
 
-                        flow = raft.compute_raft_flow(
+                        flow = warp.compute_raft_flow(
                             prev_tensor.unsqueeze(0),
                             curr_tensor.unsqueeze(0),
                             max_size=max(frame_H, frame_W),
@@ -550,9 +548,7 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
     raft = raft_flow(device="cuda") if warp else None
 
     predictor = build_sam3_video_predictor(
-        checkpoint_path = download_ckpt_from_hf(version="sam3"),
-        # checkpoint_path = "assets/sam3.pt",
-        bpe_path = "assets/bpe_simple_vocab_16e6.txt.gz",
+        checkpoint_path = download_ckpt_from_hf(version="sam3_fp16"),
         gpus_to_use = None,
         has_presence_token = False,
         geo_encoder_use_img_cross_attn = False,
@@ -564,9 +560,7 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
     ) if not sam31 else None
     
     predictor = build_sam3_multiplex_video_predictor(
-        # checkpoint_path = download_ckpt_from_hf(version="sam3"),
-        checkpoint_path = "assets/sam3.pt",
-        bpe_path = "assets/bpe_simple_vocab_16e6.txt.gz",
+        checkpoint_path = download_ckpt_from_hf(version="sam3.1"),
         max_num_objects = 1,
         multiplex_count = 1,
         use_fa3 = False,
@@ -634,7 +628,7 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
         
         if full_sbs:
             pil_frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in  frames]     
-            masks = process_frames(frames=frames, frames_pil=pil_frames, prompt_text=prompt_text, max_frames_to_track=max_track, frame_idx=frame_count)
+            masks = process_frames(frames=frames, frames_pil=pil_frames, prompt_text=prompt_text, max_frames_to_track=max_track, frame_idx=frame_count, warp=raft)
             masks_r = [f[:, half_w:] for f in masks]
             masks_l = [f[:, :half_w] for f in masks]
             masks_l = process_mask(masks_l, sensitivity=1.0, mask_blur=0, mask_offset=-2, fill_holes=False, invert_output=False, dilation=0, feather_radius=2.0, smooth_edges=1, davinci=True)
@@ -647,8 +641,10 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
             masks_r = process_mask(masks_r, sensitivity=1.0, mask_blur=0, mask_offset=-2, fill_holes=False, invert_output=False, dilation=0, feather_radius=2.0, smooth_edges=1, davinci=True)
 
         else:
-            masks_l = process_frames(predictor=predictor, frames=[f[:, :half_w] for f in frames], prompt_text=prompt_text, max_frames_to_track=max_track, frame_idx=frame_count)
-            masks_r = process_frames(predictor=predictor, frames=[f[:, half_w:] for f in frames], prompt_text=prompt_text, max_frames_to_track=max_track, frame_idx=frame_count)
+            masks_l = process_frames(predictor=predictor, frames=[f[:, :half_w] for f in frames], prompt_text=prompt_text, max_frames_to_track=max_track, frame_idx=frame_count, warp=raft)
+
+            masks_r = process_frames(predictor=predictor, frames=[f[:, half_w:] for f in frames], prompt_text=prompt_text, max_frames_to_track=max_track, frame_idx=frame_count, warp=raft)
+
             masks_l = process_mask(masks_l, sensitivity=1.0, mask_blur=0, mask_offset=-1, fill_holes=False, invert_output=False, dilation=2, feather_radius=2.0, smooth_edges=3, davinci=True)
             masks_r = process_mask(masks_r, sensitivity=1.0, mask_blur=0, mask_offset=-1, fill_holes=False, invert_output=False, dilation=2, feather_radius=2.0, smooth_edges=3, davinci=True)
             
@@ -759,12 +755,12 @@ if __name__ == "__main__":
         video_path2=video_path2,
         output_dir=OUTPUT_FOLDER,        
         prompt_text="One girl",
-        batch_size=100,
+        batch_size=5,
         matte_size=0.4,
         warp=False,
         full_sbs=False,
         alpha_pack=alpha_pack,
         left_right=left_right,
-        debug=None,
+        debug=5,
         bbox=None,
     )
