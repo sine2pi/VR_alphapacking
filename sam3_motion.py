@@ -36,7 +36,7 @@ def download_ckpt_from_hf(version="sam3"):
         ckpt_name = "sam3.pt"
         cfg_name = "config.json"
 
-            #if you dont have the model force_download=True local_files_only=False and enter a token for hf.. the fp16s are a little wonky. sam3 is good. they kind of messed 3.1 up.
+            #if you dont have the model force_download=True local_files_only=False and enter a token for hf.. the fp16s are fine. sam3 is good. they kind of messed 3.1 up.
     _ = hf_hub_download(repo_id=repo_id, filename=cfg_name, force_download=False, local_files_only=False, token="")
     checkpoint_path = hf_hub_download(repo_id=repo_id, filename=ckpt_name, force_download=False, local_files_only=False, token="")
     return checkpoint_path
