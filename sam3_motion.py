@@ -568,8 +568,8 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
         session_expiration_sec = 5000,
         default_output_prob_thresh = 0.5,
         async_loading_frames = True,
-    ) if sam31 else predictor
-
+    ) if sam31 else predictor           
+     
     frames_tot, keyframes, width, height, duration, fps = metadata(video_path1)
     half_w = width // 2
 
