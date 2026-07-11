@@ -653,8 +653,8 @@ def download_ckpt_from_hf(version="sam3"):
         ckpt_name = "sam3.pt"
         cfg_name = "config.json"
 
-    _ = hf_hub_download(repo_id=repo_id, filename=cfg_name, force_download=False, local_files_only=False, token="")
-    checkpoint_path = hf_hub_download(repo_id=repo_id, filename=ckpt_name, force_download=False, local_files_only=False, token="")
+    _ = hf_hub_download(repo_id=repo_id, filename=cfg_name, force_download=False, local_files_only=False)
+    checkpoint_path = hf_hub_download(repo_id=repo_id, filename=ckpt_name, force_download=False, local_files_only=False)
     return checkpoint_path
 
 def build_sam3_video_model(
