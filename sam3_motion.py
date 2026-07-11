@@ -605,7 +605,7 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
         mattes = []
       
         for _ in range(keyframes if batch_size is None else batch_size):
-            try:
+            try: # There is no try only do. todo: nuke all try/except blocks
                 if alpha_pack:        
                     frame_bgr = next(sbs)
                     frames.append(frame_bgr)        
