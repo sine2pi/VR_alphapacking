@@ -540,10 +540,9 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
 
     return output
 
-def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_text=None, batch_size=None, matte_size=None, warp=False, full_sbs=False, alpha_pack=False, left_right=False, debug=None, bbox=None, overlay=False, track_prev=False, sam31=False):  
-
-    raft = raft_flow(device="cuda") if warp else None
-
+def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_text=None, 
+                         batch_size=None, matte_size=None, warp=False, full_sbs=False, alpha_pack=False, 
+                         left_right=False, debug=None, bbox=None, overlay=False, track_prev=False, sam31=False):  
     if sam31:
         from sam3.model_builder import build_sam3_multiplex_video_predictor
         predictor = build_sam3_multiplex_video_predictor(
@@ -556,8 +555,7 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
             warm_up = False,
             session_expiration_sec = 5000,
             default_output_prob_thresh = 0.5,
-            async_loading_frames = True,
-        ) 
+            async_loading_frames = True) 
     else:
         predictor = build_sam3_video_predictor(
             checkpoint_path = download_ckpt_from_hf(version="sam3"),
@@ -568,9 +566,9 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
             async_loading_frames = True,
             video_loader_type = "cv2",
             apply_temporal_disambiguation = True,
-            compile = False
-        ) 
-                  
+            compile = False) 
+
+    raft = raft_flow(device="cuda") if warp else None
     frames_tot, keyframes, width, height, duration, fps = metadata(video_path1)
     half_w = width // 2
 
@@ -578,7 +576,7 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
         frames_tot2, keyframes2, width2, height2, duration2, fps2 = metadata(video_path2)
         half_w2 = width2 // 2
         sbs = video_frame_generator(video_path1, force_rate=0, frame_load_cap=debug or 0, skip_first_frames=0, select_every_nth=1, output_format="bgr24")
-        _ = next(sbs)         
+        _ = next(sbs)         #hacky
         matte = video_frame_generator(video_path2, force_rate=0, frame_load_cap=debug or 0, skip_first_frames=0, select_every_nth=1, output_format="bgr24")
         _ = next(matte)         
     else:
