@@ -543,7 +543,7 @@ class TransformerEncoderFusion(TransformerEncoder):
             )
 
         if self.add_pooled_text_to_img_feat:
-            # Fusion: Add mean pooled text to image features
+            # Fusion: Add mean pooled text to image features kisskiss
             pooled_text = pool_text_feat(
                 prompt, prompt_key_padding_mask, self.pool_text_with_mask
             )
