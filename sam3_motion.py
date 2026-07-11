@@ -626,9 +626,9 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
         print(f"Processing chunk of {chunk} frames, total processed: {frame_count}/{frames_tot}")
         max_track = frames_tot - frame_count
         
-        if full_sbs:
+        if full_sbs: # sam3 seems to be able to segment side by side as if it were a single image. You text prompt "one girl" and it will segment both left and right as if it see "one girl". Nothing special about the attention or rope..
             pil_frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in  frames]     
-            masks = process_frames(frames=frames, frames_pil=pil_frames, prompt_text=prompt_text, max_frames_to_track=max_track, frame_idx=frame_count, warp=raft)
+            masks = process_frames(predictor, frames, frames_pil=pil_frames, prompt_text=prompt_text, max_frames_to_track=max_track, frame_idx=frame_count, warp=raft)
             masks_r = [f[:, half_w:] for f in masks]
             masks_l = [f[:, :half_w] for f in masks]
             masks_l = process_mask(masks_l, sensitivity=1.0, mask_blur=0, mask_offset=-2, fill_holes=False, invert_output=False, dilation=0, feather_radius=2.0, smooth_edges=1, davinci=True)
@@ -641,9 +641,9 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
             masks_r = process_mask(masks_r, sensitivity=1.0, mask_blur=0, mask_offset=-2, fill_holes=False, invert_output=False, dilation=0, feather_radius=2.0, smooth_edges=1, davinci=True)
 
         else:
-            masks_l = process_frames(predictor=predictor, frames=[f[:, :half_w] for f in frames], prompt_text=prompt_text, max_frames_to_track=max_track, frame_idx=frame_count, warp=raft)
+            masks_l = process_frames(predictor, frames=[f[:, :half_w] for f in frames], prompt_text=prompt_text, max_frames_to_track=max_track, frame_idx=frame_count, warp=raft)
 
-            masks_r = process_frames(predictor=predictor, frames=[f[:, half_w:] for f in frames], prompt_text=prompt_text, max_frames_to_track=max_track, frame_idx=frame_count, warp=raft)
+            masks_r = process_frames(predictor, frames=[f[:, half_w:] for f in frames], prompt_text=prompt_text, max_frames_to_track=max_track, frame_idx=frame_count, warp=raft)
 
             masks_l = process_mask(masks_l, sensitivity=1.0, mask_blur=0, mask_offset=-1, fill_holes=False, invert_output=False, dilation=2, feather_radius=2.0, smooth_edges=3, davinci=True)
             masks_r = process_mask(masks_r, sensitivity=1.0, mask_blur=0, mask_offset=-1, fill_holes=False, invert_output=False, dilation=2, feather_radius=2.0, smooth_edges=3, davinci=True)
