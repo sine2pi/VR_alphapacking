@@ -1005,7 +1005,7 @@ def functional_attention(
         assert dropout == 0.0
         out = flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
     else:
-        with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+        with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION): # removed the stupid flash attention dependency. and guess what? same speed. 
             out = torchF.scaled_dot_product_attention(q, k, v, dropout_p=dropout)
         out = out.transpose(1, 2)  #  B * n * n_heads * (cv // num_heads)
 
