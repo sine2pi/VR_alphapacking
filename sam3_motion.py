@@ -268,7 +268,6 @@ class otherAlphaPacker:
         return p_frame
 
 def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_idx=0, object_id=1, start_frame_idx=0, max_frames_to_track=-1, close_after_propagation=True, keep_model_loaded=True, session_id=None, prev_mask=None, positive_coords=None, negative_coords=None, bbox=None, propagation_direction="forward", sam31=False, warp=None, prev_frame=None, matte_size=None, prev_flow=None, max_size=1008):
-    # count += 1
 
     frames = [cv2.resize(f, (max_size, max_size), interpolation=cv2.INTER_LANCZOS4) for f in frames] if max_size is not None else frames
     frames_pil = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames] 
@@ -578,6 +577,7 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
     if alpha_pack:
         frames_tot2, keyframes2, width2, height2, duration2, fps2 = metadata(video_path2)
         half_w2 = width2 // 2
+        #i wrote a better function will remove this hacky-ness
         sbs = video_frame_generator(video_path1, force_rate=0, frame_load_cap=debug or 0, skip_first_frames=0, select_every_nth=1, output_format="bgr24")
         _ = next(sbs)         
         matte = video_frame_generator(video_path2, force_rate=0, frame_load_cap=debug or 0, skip_first_frames=0, select_every_nth=1, output_format="bgr24")
@@ -598,7 +598,6 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
     frame_count = 0
     frames_tot = frames_tot if debug is None else debug
     batch_size = frames_tot if batch_size == 0 else batch_size
-
     pbar = tqdm(total=frames_tot, desc="Processing .. beep.boop.bop.. beep.")
 
     while frame_count < frames_tot:
@@ -642,9 +641,7 @@ def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_t
 
         else:
             masks_l = process_frames(predictor, frames=[f[:, :half_w] for f in frames], prompt_text=prompt_text, max_frames_to_track=max_track, frame_idx=frame_count, warp=raft)
-
             masks_r = process_frames(predictor, frames=[f[:, half_w:] for f in frames], prompt_text=prompt_text, max_frames_to_track=max_track, frame_idx=frame_count, warp=raft)
-
             masks_l = process_mask(masks_l, sensitivity=1.0, mask_blur=0, mask_offset=-1, fill_holes=False, invert_output=False, dilation=2, feather_radius=2.0, smooth_edges=3, davinci=True)
             masks_r = process_mask(masks_r, sensitivity=1.0, mask_blur=0, mask_offset=-1, fill_holes=False, invert_output=False, dilation=2, feather_radius=2.0, smooth_edges=3, davinci=True)
             
