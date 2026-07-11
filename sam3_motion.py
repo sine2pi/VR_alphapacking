@@ -2,7 +2,7 @@
 from huggingface_hub import hf_hub_download
 # import pkg_resources
 from torch import set_default_dtype
-from imagemask import *
+from masksandthings import *
 from sam3.model.sam3_video_predictor import Sam3VideoPredictorMultiGPU
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
