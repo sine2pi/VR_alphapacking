@@ -37,7 +37,7 @@ def ffmpeg_pipe(out_path, width, height, fps, audio_source=None):
 
     return subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-class AlphaPacker:
+class ToddPacker:
     def __init__(n, scale=0.40, padding=0, circle=False):
 
         n.scale = scale
@@ -356,7 +356,7 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
                         merged = (merged_prob * 255).to(dtype=torch.uint8)
                         output[frame_idx] = merged
                         hard_masks.append(output)
-                        
+
                     else:
                         objects[frame_idx] = torch.zeros((1, H, W), dtype=torch.float32, device=tensor.device if 'tensor' in locals() else None)
                         
@@ -477,7 +477,7 @@ batch_size=None, matte_size=None, warp=False, debug=None, sam31=False):
 
     writer = ffmpeg_pipe(out_path, width, height, fps, audio_source=video_path1) if out_path else None
     mask_writer = ffmpeg_pipe(mask_path, width, height, fps) if mask_path else None
-    packer = AlphaPacker(scale=matte_size, circle=False)
+    packer = ToddPacker(scale=matte_size, circle=False)
 
     frame_count = 0
     total_frames = total_frames if debug is None else debug
