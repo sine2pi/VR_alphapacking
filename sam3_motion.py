@@ -73,17 +73,16 @@ class ToddPacker:
         q_bl_circle = None 
         q_br_circle = None
 
-        def blend_white_mask(roi, mask_1ch, inv_circle_slice=None):
-
-            if inv_circle_slice is None:
-                inv_mask_3d = (255 - mask_1ch)[..., None]
-                blended = (roi.to(torch.int32) * inv_mask_3d) // 255
-                blended += mask_1ch[..., None]
-                x = blended.to(torch.uint8)
+        def blend_white_mask(roi, mask_1ch, red=True):
+            if red:
+                alpha = mask_1ch.unsqueeze(-1)
+                red_color = torch.tensor([255.0, 0.0, 0.0], dtype=torch.float32, device=roi.device)
+                x = ((1.0 - alpha) * roi.float() + alpha * red_color).to(torch.uint8)
             else:
-                blended = roi.to(torch.float32) * inv_circle_slice
-                blended += mask_1ch[..., None]
-                x = torch.clamp(blended, 0, 255).to(torch.uint8)
+                alpha = (255 - mask_1ch)[..., None]
+                blend = (roi.to(torch.int32) * alpha) // 255
+                blend += mask_1ch[..., None]
+                x = blend.to(torch.uint8)
             return x
 
         y1_top = n.padding
@@ -127,7 +126,6 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
  negative_coords=None, bbox=None, propagation_direction="forward", sam31=False, warp=None, prev_frame=None, matte_size=None, prev_flow=None, max_side=1.0, objects_out=False):
 
     H, W, C = int(frames[0].shape[0]), int(frames[0].shape[1]), int(frames[0].shape[2])  
-    Ho, Wo, Co = H, W, C
 
     if max_side is not None:
         if min(H, W) < 4096:
@@ -149,7 +147,7 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
 
     frames = [F.interpolate(f, size=(H, W), mode='bicubic', antialias=True) for f in frames] if aorb(max_side, 1.0) else frames
     frames_pil = [Image.fromarray((f.squeeze(0).permute(1, 2, 0).cpu().numpy() * (255 if f.max() <= 1.0 else 1)).astype('uint8')) for f in frames]
-    B, C, H, W = int(frames[0].shape[0]), int(frames[0].shape[1]), int(frames[0].shape[2]), int(frames[0].shape[3])
+    B, C, H, W = frames[0].shape
 
     chunk = len(frames_pil)
     if frame_idx > chunk - 1:
@@ -307,10 +305,10 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
                         flow[1] *= (h_mask / W)
 
                         warped_logits = raft.warp_frame(prev_logits, flow)
+
                         dummy_point_inputs = {
                             "point_coords": torch.zeros(batch_size, 1, 2, device=device),
-                            "point_labels": -torch.ones(batch_size, 1, dtype=torch.int32, device=device)
-                        }
+                            "point_labels": -torch.ones(batch_size, 1, dtype=torch.int32, device=device)}
 
                         current_out, _ = predictor.model.tracker._run_single_frame_inference(
                             inference_state=state,
@@ -322,8 +320,7 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
                             mask_inputs=None,
                             reverse=False,
                             run_mem_encoder=True,
-                            prev_sam_mask_logits=warped_logits,
-                        )
+                            prev_sam_mask_logits=warped_logits)
 
                         if current_out["pred_masks"].max() < 0.0:
                             if warped_logits.max() > 0.0:
@@ -451,8 +448,7 @@ batch_size=None, matte_size=None, warp=False, debug=None, sam31=False):
             warm_up = False,
             session_expiration_sec = 5000,
             default_output_prob_thresh = 0.5,
-            async_loading_frames = True,            
-        )
+            async_loading_frames = True)
 
     else:
         predictor = build_sam3_video_predictor(
@@ -467,8 +463,7 @@ batch_size=None, matte_size=None, warp=False, debug=None, sam31=False):
             apply_temporal_disambiguation = True,
             compile = False,
             max_num_objects=1,
-            num_obj_for_compile=1,
-        ) 
+            num_obj_for_compile=1) 
     
     decoder = VFG(video_path1, force_rate=0, frame_load_cap=debug or 0, skip_first_frames=0, select_every_nth=1, output_format="rgb24")
     width, height, fps, duration, total_frames, target_frame_time, out_frame = next(decoder)  
