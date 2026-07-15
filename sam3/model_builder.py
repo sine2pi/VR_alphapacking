@@ -60,6 +60,8 @@ def _setup_tf32() -> None:
 
 _setup_tf32()
 
+SIZE = 1008
+
 def _create_position_encoding(precompute_resolution=None):
     """Create position encoding for visual backbone."""
     return PositionEmbeddingSine(
@@ -69,6 +71,37 @@ def _create_position_encoding(precompute_resolution=None):
         temperature=10000,
         precompute_resolution=precompute_resolution,
     )
+
+# def _create_vit_backbone(compile_mode=None, use_fa3=False, use_rope_real=False):
+#     """Create ViT backbone for visual feature extraction."""
+#     return ViT(
+#         img_size=1008,
+#         pretrain_img_size=336,
+#         patch_size=14,
+#         embed_dim=1024,
+#         depth=32,
+#         num_heads=16,
+#         mlp_ratio=4.625,
+#         norm_layer="LayerNorm",
+#         drop_path_rate=0.1,
+#         qkv_bias=True,
+#         use_abs_pos=False,
+#         tile_abs_pos=False,
+#         global_att_blocks=(7, 15, 23, 31),
+#         rel_pos_blocks=(),
+#         use_rope=True,
+#         use_interp_rope=False,
+#         window_size=24,
+#         pretrain_use_cls_token=True,
+#         retain_cls_token=False,
+#         ln_pre=True,
+#         ln_post=False,
+#         return_interm_layers=False,
+#         bias_patch_embed=False,
+#         compile_mode=compile_mode,
+#         use_fa3=use_fa3,
+#         use_rope_real=True,
+#     )
 
 def _create_vit_backbone(compile_mode=None, use_fa3=False, use_rope_real=False):
     """Create ViT backbone for visual feature extraction."""
@@ -100,7 +133,7 @@ def _create_vit_backbone(compile_mode=None, use_fa3=False, use_rope_real=False):
         use_fa3=use_fa3,
         use_rope_real=use_rope_real,
     )
-
+    
 def _create_vit_neck(position_encoding, vit_backbone, enable_inst_interactivity=False):
     """Create ViT neck for feature pyramid."""
     return Sam3DualViTDetNeck(
@@ -302,7 +335,7 @@ def _create_sam3_model(
         "transformer": transformer,
         "input_geometry_encoder": input_geometry_encoder,
         "segmentation_head": segmentation_head,
-        "num_feature_levels": 1,
+        "num_feature_levels": 3,
         "o2m_mask_predict": True,
         "dot_prod_scoring": dot_prod_scoring,
         "use_instance_query": False,
@@ -428,7 +461,7 @@ def _create_tracker_transformer():
     return transformer
 
 def build_tracker(
-    apply_temporal_disambiguation: bool, with_backbone: bool = False, compile_mode=None
+    apply_temporal_disambiguation: bool, is_sbs: bool, with_backbone: bool = False, compile_mode=None
 ) -> Sam3TrackerPredictor:
     """
     Build the SAM3 Tracker module for video tracking.
@@ -477,6 +510,7 @@ def build_tracker(
         clear_non_cond_mem_around_input=True,
         fill_hole_area=0,
         use_memory_selection=apply_temporal_disambiguation,
+        is_sbs=is_sbs,
     )
 
     return model
@@ -517,29 +551,29 @@ def _create_sam3_transformer(
 
     return TransformerWrapper(encoder=encoder, decoder=decoder, d_model=256)
 
-def _load_checkpoint(model, checkpoint_path):
-    """Load model checkpoint from file."""
-    with g_pathmgr.open(checkpoint_path, "rb") as f:
-        ckpt = torch.load(f, map_location="cpu", weights_only=True)
-    if "model" in ckpt and isinstance(ckpt["model"], dict):
-        ckpt = ckpt["model"]
-    sam3_image_ckpt = {
-        k.replace("detector.", ""): v for k, v in ckpt.items() if "detector" in k
-    }
-    if model.inst_interactive_predictor is not None:
-        sam3_image_ckpt.update(
-            {
-                k.replace("tracker.", "inst_interactive_predictor.model."): v
-                for k, v in ckpt.items()
-                if "tracker" in k
-            }
-        )
-    missing_keys, _ = model.load_state_dict(sam3_image_ckpt, strict=False)
-    if len(missing_keys) > 0:
-        print(
-            f"loaded {checkpoint_path} and found "
-            f"missing and/or unexpected keys:\n{missing_keys=}"
-        )
+# def _load_checkpoint(model, checkpoint_path):
+#     """Load model checkpoint from file."""
+#     with g_pathmgr.open(checkpoint_path, "rb") as f:
+#         ckpt = torch.load(f, map_location="cpu", weights_only=True)
+#     if "model" in ckpt and isinstance(ckpt["model"], dict):
+#         ckpt = ckpt["model"]
+#     sam3_ckpt= {
+#         k.replace("detector.", ""): v for k, v in ckpt.items() if "detector" in k
+#     }
+#     if model.inst_interactive_predictor is not None:
+#         sam3_ckpt.update(
+#             {
+#                 k.replace("tracker.", "inst_interactive_predictor.model."): v
+#                 for k, v in ckpt.items()
+#                 if "tracker" in k
+#             }
+#         )
+#     missing_keys, _ = model.load_state_dict(sam3_ckpt, strict=False)
+#     if len(missing_keys) > 0:
+#         print(
+#             f"loaded {checkpoint_path} and found "
+#             f"missing and/or unexpected keys:\n{missing_keys=}"
+#         )
 
 def _setup_device_and_mode(model, device, eval_mode):
     """Setup model device and evaluation mode."""
@@ -558,6 +592,7 @@ def build_sam3_image_model(
     enable_segmentation=True,
     enable_inst_interactivity=False,
     compile=False,
+    is_sbs=False,
 ):
     """
     Build SAM3 image model
@@ -607,7 +642,7 @@ def build_sam3_image_model(
     # Create geometry encoder
     input_geometry_encoder = _create_geometry_encoder()
     if enable_inst_interactivity:
-        sam3_pvs_base = build_tracker(apply_temporal_disambiguation=False)
+        sam3_pvs_base = build_tracker(apply_temporal_disambiguation=False, is_sbs=False)
         inst_predictor = SAM3InteractiveImagePredictor(sam3_pvs_base)
     else:
         inst_predictor = None
@@ -633,7 +668,6 @@ def build_sam3_image_model(
     return model
 
 def download_ckpt_from_hf(version="sam3"):
-
     if version == "sam3.1":
         repo_id = "facebook/sam3.1"
         ckpt_name = "sam3.1_multiplex.pt"
@@ -658,15 +692,19 @@ def download_ckpt_from_hf(version="sam3"):
     return checkpoint_path
 
 def build_sam3_video_model(
+    is_sbs: bool = True,
     checkpoint_path: Optional[str] = None,
     load_from_HF=True,
     bpe_path: Optional[str] = None,
     has_presence_token: bool = True,
     geo_encoder_use_img_cross_attn: bool = True,
-    strict_state_dict_loading: bool = True,
+    strict_state_dict_loading: bool = False,
     apply_temporal_disambiguation: bool = True,
     device="cuda" if torch.cuda.is_available() else "cpu",
     compile=False,
+    max_num_objects=1,
+    num_obj_for_compile=1,
+    
 ) -> Sam3VideoInferenceWithInstanceInteractivity:
     """
     Build SAM3 dense tracking model.
@@ -684,7 +722,7 @@ def build_sam3_video_model(
         )
 
     # Build Tracker module
-    tracker = build_tracker(apply_temporal_disambiguation=apply_temporal_disambiguation)
+    tracker = build_tracker(apply_temporal_disambiguation=apply_temporal_disambiguation, is_sbs=is_sbs)
 
     # Build Detector components
     visual_neck = _create_vision_backbone()
@@ -724,43 +762,78 @@ def build_sam3_video_model(
 
     # Build the main SAM3 video model
     if apply_temporal_disambiguation:
+
         model = Sam3VideoInferenceWithInstanceInteractivity(
             detector=detector,
             tracker=tracker,
-            score_threshold_detection=0.75,
+            score_threshold_detection=0.65,
             assoc_iou_thresh=0.1,
-            det_nms_thresh=0.1,
-            new_det_thresh=0.9,
-            hotstart_delay=15,
-            hotstart_unmatch_thresh=8,
-            hotstart_dup_thresh=8,
+            det_nms_thresh=0.5,
+            new_det_thresh=1.0,
+            hotstart_delay=8,
+            hotstart_unmatch_thresh=4,
+            hotstart_dup_thresh=4,
             suppress_unmatched_only_within_hotstart=False,
             min_trk_keep_alive=-1,
-            max_trk_keep_alive=300,
-            init_trk_keep_alive=30,
+            max_trk_keep_alive=64,
+            init_trk_keep_alive=5,
             suppress_overlapping_based_on_recent_occlusion_threshold=0.7,
             suppress_det_close_to_boundary=False,
             fill_hole_area=8,
-            recondition_every_nth_frame=32,
+            recondition_every_nth_frame=64,
             masklet_confirmation_enable=True,
             decrease_trk_keep_alive_for_empty_masklets=True,
             image_size=1008,
             image_mean=(0.5, 0.5, 0.5),
             image_std=(0.5, 0.5, 0.5),
             compile_model=compile,
+            max_num_objects=max_num_objects,
+            num_obj_for_compile=num_obj_for_compile,
+
         )
+
+        # model = Sam3VideoInferenceWithInstanceInteractivity(
+        #     detector=detector,
+        #     tracker=tracker,
+        #     score_threshold_detection=0.80,
+        #     assoc_iou_thresh=0.1,
+        #     det_nms_thresh=0.2,
+        #     new_det_thresh=1.0,
+        #     hotstart_delay=0,
+        #     hotstart_unmatch_thresh=0,
+        #     hotstart_dup_thresh=0,
+        #     suppress_unmatched_only_within_hotstart=False,
+        #     min_trk_keep_alive=-1,
+        #     max_trk_keep_alive=10,
+        #     init_trk_keep_alive=10,
+        #     suppress_overlapping_based_on_recent_occlusion_threshold=0.7,
+        #     suppress_det_close_to_boundary=False,
+        #     fill_hole_area=0,
+        #     recondition_every_nth_frame=0,
+        #     masklet_confirmation_enable=False,
+        #     decrease_trk_keep_alive_for_empty_masklets=False,
+        #     image_size=1008,
+        #     image_mean=(0.5, 0.5, 0.5),
+        #     image_std=(0.5, 0.5, 0.5),
+        #     compile_model=compile,
+        #     max_num_objects=max_num_objects,
+        #     num_obj_for_compile=num_obj_for_compile,
+
+        # )
+
     else:
-        # a version without any heuristics for ablation studies
+
         model = Sam3VideoInferenceWithInstanceInteractivity(
+
             detector=detector,
             tracker=tracker,
             score_threshold_detection=0.5,
             assoc_iou_thresh=0.1,
             det_nms_thresh=0.1,
-            new_det_thresh=0.7,
+            new_det_thresh=0.99,
             hotstart_delay=15,
-            hotstart_unmatch_thresh=8,
-            hotstart_dup_thresh=8,
+            hotstart_unmatch_thresh=2,
+            hotstart_dup_thresh=3,
             suppress_unmatched_only_within_hotstart=True,
             min_trk_keep_alive=-1,
             max_trk_keep_alive=30,
@@ -775,11 +848,68 @@ def build_sam3_video_model(
             image_mean=(0.5, 0.5, 0.5),
             image_std=(0.5, 0.5, 0.5),
             compile_model=compile,
+            max_num_objects=2,
+            num_obj_for_compile=2,
         )
 
+    # # Build the main SAM3 video model
+    # if apply_temporal_disambiguation:
+    #     model = Sam3VideoInferenceWithInstanceInteractivity(
+    #         detector=detector,
+    #         tracker=tracker,
+    #         score_threshold_detection=0.75,
+    #         assoc_iou_thresh=0.1,
+    #         det_nms_thresh=0.1,
+    #         new_det_thresh=0.9,
+    #         hotstart_delay=15,
+    #         hotstart_unmatch_thresh=8,
+    #         hotstart_dup_thresh=8,
+    #         suppress_unmatched_only_within_hotstart=False,
+    #         min_trk_keep_alive=-1,
+    #         max_trk_keep_alive=300,
+    #         init_trk_keep_alive=30,
+    #         suppress_overlapping_based_on_recent_occlusion_threshold=0.7,
+    #         suppress_det_close_to_boundary=False,
+    #         fill_hole_area=8,
+    #         recondition_every_nth_frame=32,
+    #         masklet_confirmation_enable=True,
+    #         decrease_trk_keep_alive_for_empty_masklets=True,
+    #         image_size=1008,
+    #         image_mean=(0.5, 0.5, 0.5),
+    #         image_std=(0.5, 0.5, 0.5),
+    #         compile_model=compile,
+    #     )
+    # else:
+    #     # a version without any heuristics for ablation studies
+    #     model = Sam3VideoInferenceWithInstanceInteractivity(
+    #         detector=detector,
+    #         tracker=tracker,
+    #         score_threshold_detection=0.5,
+    #         assoc_iou_thresh=0.1,
+    #         det_nms_thresh=0.1,
+    #         new_det_thresh=0.7,
+    #         hotstart_delay=15,
+    #         hotstart_unmatch_thresh=8,
+    #         hotstart_dup_thresh=8,
+    #         suppress_unmatched_only_within_hotstart=True,
+    #         min_trk_keep_alive=-1,
+    #         max_trk_keep_alive=30,
+    #         init_trk_keep_alive=30,
+    #         suppress_overlapping_based_on_recent_occlusion_threshold=0.7,
+    #         suppress_det_close_to_boundary=False,
+    #         fill_hole_area=8,
+    #         recondition_every_nth_frame=32,
+    #         masklet_confirmation_enable=False,
+    #         decrease_trk_keep_alive_for_empty_masklets=False,
+    #         image_size=1008,
+    #         image_mean=(0.5, 0.5, 0.5),
+    #         image_std=(0.5, 0.5, 0.5),
+    #         compile_model=compile,
+    #     )
+
     # Load checkpoint if provided
-    if load_from_HF and checkpoint_path is None:
-        checkpoint_path = download_ckpt_from_hf(version="sam3")
+    # if load_from_HF and checkpoint_path is None:
+    checkpoint_path = download_ckpt_from_hf(version="sam3")
     if checkpoint_path is not None:
         with g_pathmgr.open(checkpoint_path, "rb") as f:
             ckpt = torch.load(f, map_location="cpu", weights_only=True)
@@ -797,9 +927,48 @@ def build_sam3_video_model(
     model.to(device=device)
     return model
 
-def build_sam3_video_predictor(*model_args, gpus_to_use=None, **model_kwargs):
+#     model = _load_checkpoint(model, checkpoint_path)
+
+#     model.eval()
+#     return model
+
+# def _load_checkpoint(model, checkpoint_path = "assets/sam3.pt", interactive=False):
+#     from ultralytics.utils.patches import torch_load
+#     checkpoint_path = "assets/sam3.pt"
+#     with open(checkpoint_path, "rb") as f:
+#         ckpt = torch_load(f)
+#     if "model" in ckpt and isinstance(ckpt["model"], dict):
+#         ckpt = ckpt["model"]
+#     sam3_ckpt= {k.replace("detector.", ""): v for k, v in ckpt.items() if "detector" in k}
+#     if interactive:
+#         sam3_ckpt.update(
+#             {
+#                 k.replace("backbone.vision_backbone", "image_encoder.vision_backbone"): v
+#                 for k, v in sam3_ckpt.items()
+#                 if "backbone.vision_backbone" in k
+#             }
+#         )
+#         sam3_ckpt.update(
+#             {
+#                 k.replace("tracker.transformer.encoder", "memory_attention"): v
+#                 for k, v in ckpt.items()
+#                 if "tracker.transformer" in k
+#             }
+#         )
+#         sam3_ckpt.update(
+#             {
+#                 k.replace("tracker.maskmem_backbone", "memory_encoder"): v
+#                 for k, v in ckpt.items()
+#                 if "tracker.maskmem_backbone" in k
+#             }
+#         )
+#         sam3_ckpt.update({k.replace("tracker.", ""): v for k, v in ckpt.items() if "tracker." in k})
+#     model.load_state_dict(sam3_ckpt, strict=False)
+#     return model
+
+def build_sam3_video_predictor(*model_args, gpus_to_use=None, is_sbs=True, **model_kwargs):
     return Sam3VideoPredictorMultiGPU(
-        *model_args, gpus_to_use=gpus_to_use, **model_kwargs
+        *model_args, gpus_to_use=gpus_to_use, is_sbs=is_sbs, **model_kwargs
     )
 
 def _create_multiplex_maskmem_backbone(multiplex_count=16):
@@ -919,9 +1088,10 @@ def build_sam3_multiplex_video_model(
     multiplex_count: int = 16,
     use_fa3: bool = False,
     use_rope_real: bool = False,
-    strict_state_dict_loading: bool = True,
+    strict_state_dict_loading: bool = False,
     device="cuda" if torch.cuda.is_available() else "cpu",
     compile=False,
+    is_sbs=True,
 ):
     """
     Build SAM3 multiplex video tracking model.
@@ -1023,6 +1193,7 @@ def build_sam3_multiplex_video_model(
         },
         compile_all_components=compile,
         use_memory_selection=False,
+        is_sbs=True,
     )
 
     # Load checkpoint if provided
@@ -1051,12 +1222,14 @@ def build_sam3_multiplex_video_predictor(
     max_num_objects: int = 16,
     multiplex_count: int = 16,
     use_fa3: bool = True,
-    use_rope_real: bool = True,
+    use_rope_real: bool = False,
     compile: bool = False,
     warm_up: bool = False,
     session_expiration_sec: int = 1200,
     default_output_prob_thresh: float = 0.5,
     async_loading_frames: bool = True,
+    is_sbs=True,
+    num_obj_for_compile=1,
 ):
     """
     Build a fully-initialized Sam3MultiplexVideoPredictor.
@@ -1173,16 +1346,17 @@ def build_sam3_multiplex_video_predictor(
         image_mean=(0.5, 0.5, 0.5),
         image_std=(0.5, 0.5, 0.5),
         compile_model=compile,
+        is_sbs=True,
+        
     )
 
-    # Load checkpoint (auto-download from HuggingFace if not provided)
     if checkpoint_path is None:
         checkpoint_path = download_ckpt_from_hf(version="sam3.1")
     if checkpoint_path is not None:
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         if "model" in ckpt and isinstance(ckpt["model"], dict):
             ckpt = ckpt["model"]
-  
+
         needs_remap = any(
             k.startswith("sam3_model.") or k.startswith("sam2_predictor.") for k in ckpt
         )
@@ -1206,7 +1380,6 @@ def build_sam3_multiplex_video_predictor(
 
     demo_model.cuda().eval()
 
-    # Wrap in predictor
     predictor = Sam3MultiplexVideoPredictor(
         model=demo_model,
         session_expiration_sec=session_expiration_sec,
@@ -1226,9 +1399,12 @@ def build_sam3_predictor(
     max_num_objects: int = 16,
     multiplex_count: int = 16,
     # Common
-    use_fa3: bool = True,
-    use_rope_real: bool = True,
+    use_fa3: bool = False,
+    use_rope_real: bool = False,
     async_loading_frames: bool = True,
+    is_sbs = True,
+
+    num_obj_for_compile=1,
     **kwargs,
 ):
     """
@@ -1280,6 +1456,8 @@ def build_sam3_predictor(
             compile=compile,
             warm_up=warm_up,
             async_loading_frames=async_loading_frames,
+            is_sbs=is_sbs,
+            num_obj_for_compile=num_obj_for_compile,
             **kwargs,
         )
     elif version == "sam3.1_fp16":
@@ -1293,6 +1471,8 @@ def build_sam3_predictor(
             compile=compile,
             warm_up=warm_up,
             async_loading_frames=async_loading_frames,
+            is_sbs=is_sbs,
+            num_obj_for_compile=num_obj_for_compile,
             **kwargs,
         )
 
@@ -1302,6 +1482,8 @@ def build_sam3_predictor(
             bpe_path=bpe_path,
             compile=compile,
             async_loading_frames=async_loading_frames,
+            is_sbs=is_sbs,
+            max_num_objects= max_num_objects, num_obj_for_compile=num_obj_for_compile,
             **kwargs,
         )
 
@@ -1311,6 +1493,8 @@ def build_sam3_predictor(
             bpe_path=bpe_path,
             compile=compile,
             async_loading_frames=async_loading_frames,
+            is_sbs=is_sbs,
+            max_num_objects= max_num_objects, num_obj_for_compile=num_obj_for_compile,
             **kwargs,
         )
     else:
