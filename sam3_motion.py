@@ -1,9 +1,8 @@
 
-from huggingface_hub import hf_hub_download
 from torch import set_default_dtype
 from masksandthings import *
-import torchvision.transforms.functional as TVF
 import torch.nn.functional as F
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
 set_default_dtype(dtype)
