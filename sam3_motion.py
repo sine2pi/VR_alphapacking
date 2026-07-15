@@ -49,26 +49,6 @@ class AlphaPacker:
         n.circle = circle
         n._cache = None
 
-    def _circle(n, w, h):
-        if n._cache is not None and n._cache.shape == (h, w):
-            return n._cache
-
-        y = np.arange(h, dtype=np.float32)
-        x = np.arange(w, dtype=np.float32)
-        grid_y, grid_x = np.meshgrid(y, x, indexing='ij')
-
-        cy, cx = h / 2.0 - 0.5, w / 2.0 - 0.5
-        r = np.sqrt((grid_x - cx)**2 + (grid_y - cy)**2)
-
-        max_r = min(w, h) / 2.0
-        outer_r = max_r * 0.55  
-        inner_r = max_r * 0.45  
-        
-        t = np.clip((outer_r - r) / (outer_r - inner_r), 0.0, 1.0) 
-        cache = t * t * (3.0 - 2.0 * t)
-        n._cache = cache
-        return n._cache
-
     def pack_frame(n, frames, mask_l = None, mask_r = None):
 
         H, SBS_W, C = frames.shape
@@ -78,8 +58,8 @@ class AlphaPacker:
         target_h = int(H * n.scale)
 
         if mask_l.shape[1] != target_h or mask_l.shape[2] != target_w:
-            mask_l = F.interpolate(mask_l.unsqueeze(0).unsqueeze(0), size=(target_h, target_w), mode='area').squeeze(0).squeeze(0)
-            mask_r = F.interpolate(mask_r.unsqueeze(0).unsqueeze(0), size=(target_h, target_w), mode='area').squeeze(0).squeeze(0)
+            mask_l = F.interpolate(mask_l.unsqueeze(0).unsqueeze(0), size=(target_h, target_w), mode='bicubic', antialias=True).squeeze(0).squeeze(0)
+            mask_r = F.interpolate(mask_r.unsqueeze(0).unsqueeze(0), size=(target_h, target_w), mode='bicubic', antialias=True).squeeze(0).squeeze(0)
 
         p_frame = frames
         h_half = target_h // 2
@@ -96,14 +76,6 @@ class AlphaPacker:
         q_bl_circle = None 
         q_br_circle = None
 
-        if n.circle:
-            circle = n._circle(target_w, target_h) 
-            inv_circle_3d = (1.0 - circle)[..., np.newaxis].astype(np.float32)
-            q_tl_circle = inv_circle_3d[:h_half, :w_half]
-            q_tr_circle = inv_circle_3d[:h_half, w_half:w_half*2]
-            q_bl_circle = inv_circle_3d[h_half:h_half*2, :w_half]
-            q_br_circle = inv_circle_3d[h_half:h_half*2, w_half:w_half*2]
-               
         def blend_white_mask(roi, mask_1ch, inv_circle_slice=None):
             
             if inv_circle_slice is None:
@@ -115,7 +87,6 @@ class AlphaPacker:
                 blended = roi.to(torch.float32) * inv_circle_slice
                 blended += mask_1ch[..., None]
                 x = torch.clamp(blended, 0, 255).to(torch.uint8)
-                
             return x
 
         y1_top = n.padding
@@ -383,7 +354,7 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
                         prob_expanded = prob.unsqueeze(0) if prob.dim() == 3 else prob
                         
                         smooth_prob = torch.nn.functional.interpolate(
-                            prob_expanded, size=(H, W), mode='bilinear', align_corners=False, antialias=True
+                            prob_expanded, size=(H, W), mode='bicubic', align_corners=False, antialias=True
                         ).squeeze(0)
                         
                         objects[frame_idx] = smooth_prob.to(dtype=torch.float32)
@@ -402,7 +373,7 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
                         mask_expanded = tensor_mask.unsqueeze(0) if tensor_mask.dim() == 3 else tensor_mask
                         
                         smooth_mask = torch.nn.functional.interpolate(
-                            mask_expanded, size=(H, W), mode='bilinear', align_corners=False, antialias=True
+                            mask_expanded, size=(H, W), mode='bicubic', align_corners=False, antialias=True
                         ).squeeze(0)
                         
                         objects[frame_idx] = smooth_mask
