@@ -2,6 +2,8 @@ import torch, math, cv2, av, base64, subprocess, functools, os, re, logger, time
 from io import BytesIO
 from PIL import Image, ImageSequence, ImageOps, Image, ImageFilter
 from tqdm import tqdm
+from typing import Optional
+from torch import nn
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
