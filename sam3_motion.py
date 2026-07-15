@@ -447,8 +447,8 @@ batch_size=None, matte_size=None, warp=False, debug=None, sam31=False, red=True)
 
     else:
         predictor = build_sam3_video_predictor(
-            checkpoint_path = "assets/sam3.pt",
-            bpe_path="assets/bpe_simple_vocab_16e6.txt.gz",
+            # checkpoint_path = "assets/sam3.pt",
+            # bpe_path="assets/bpe_simple_vocab_16e6.txt.gz",
             gpus_to_use = None,
             has_presence_token = False,
             geo_encoder_use_img_cross_attn = False,
