@@ -19,8 +19,7 @@ def _setup_tf32() -> None:
 
 _setup_tf32()
 
-def build_sam3_video_predictor(*model_args, checkpoint_path=None, bpe_path=None, gpus_to_use=None, is_sbs=False,  
-max_num_objects=1, num_obj_for_compile=1, strict_state_dict_loading=False, **model_kwargs):
+def build_sam3_video_predictor(*model_args, checkpoint_path=None, bpe_path=None, gpus_to_use=None, is_sbs=False,  max_num_objects=1, num_obj_for_compile=1, strict_state_dict_loading=False, **model_kwargs):
     from sam3.model.sam3_video_predictor import Sam3VideoPredictorMultiGPU
     predictor = Sam3VideoPredictorMultiGPU(*model_args, checkpoint_path=checkpoint_path, gpus_to_use=gpus_to_use, is_sbs=is_sbs, max_num_objects= max_num_objects, num_obj_for_compile=num_obj_for_compile, strict_state_dict_loading=strict_state_dict_loading, **model_kwargs)
     return predictor
@@ -28,16 +27,14 @@ max_num_objects=1, num_obj_for_compile=1, strict_state_dict_loading=False, **mod
 def ffmpeg_pipe(out_path, width, height, fps, audio_source=None):
 
     ffmpeg_cmd = [
-        'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo', '-s', f'{width}x{height}', '-pix_fmt', 'bgr24', '-r', str(fps),
-        '-i', '-'
-    ]
+        'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo', '-s', f'{width}x{height}', '-pix_fmt', 'bgr24', '-r', str(fps), '-i', '-']
     
     if audio_source:
         ffmpeg_cmd.extend(['-i', audio_source, '-map', '0:v', '-map', '1:a?'])
         
     ffmpeg_cmd.extend([
-        '-sws_flags', 'lanczos+full_chroma_int+accurate_rnd+full_chroma_inp', '-c:v', 'hevc_qsv', '-profile:v', 'main10', '-pix_fmt', 'p010le', '-tag:v', 'hvc1', '-g', '100', '-b:v', '100M', '-preset', 'medium', '-aspect', '2:1', '-copyts', '-start_at_zero', '-bitexact', '-c:a', 'aac', '-b:a', '256k', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-fps_mode', 'cfr', '-r', str(fps), '-movflags', '+faststart+write_colr+use_metadata_tags', '-metadata:s:v:0', 'stereo_mode=left_right', '-color_trc', 'bt709', out_path
-    ])
+        '-sws_flags', 'lanczos+full_chroma_int+accurate_rnd+full_chroma_inp', '-c:v', 'hevc_qsv', '-profile:v', 'main10', '-pix_fmt', 'p010le', '-tag:v', 'hvc1', '-g', '100', '-b:v', '100M', '-preset', 'medium', '-aspect', '2:1', '-copyts', '-start_at_zero', '-bitexact', '-c:a', 'aac', '-b:a', '256k', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-fps_mode', 'cfr', '-r', str(fps), '-movflags', '+faststart+write_colr+use_metadata_tags', '-metadata:s:v:0', 'stereo_mode=left_right', '-color_trc', 'bt709', out_path])
+
     return subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 class AlphaPacker:
@@ -64,19 +61,20 @@ class AlphaPacker:
         h_half = target_h // 2
         top_half_mask = mask_l[:h_half, :]
         bottom_half_mask = mask_l[h_half:h_half*2, :]
-
         w_half = target_w // 2
+
         q_tl_mask = mask_r[:h_half, :w_half]
         q_tr_mask = mask_r[:h_half, w_half:w_half*2]
         q_bl_mask = mask_r[h_half:h_half*2, :w_half]
         q_br_mask = mask_r[h_half:h_half*2, w_half:w_half*2]
+
         q_tl_circle = None
         q_tr_circle = None
         q_bl_circle = None 
         q_br_circle = None
 
         def blend_white_mask(roi, mask_1ch, inv_circle_slice=None):
-            
+
             if inv_circle_slice is None:
                 inv_mask_3d = (255 - mask_1ch)[..., None]
                 blended = (roi.to(torch.int32) * inv_mask_3d) // 255
@@ -121,6 +119,7 @@ class AlphaPacker:
         x1_bl_l = n.padding
         x2_bl_l = n.padding + w_half
         p_frame[y1_bl_l:y2_bl_l, x1_bl_l:x2_bl_l] = blend_white_mask(p_frame[y1_bl_l:y2_bl_l, x1_bl_l:x2_bl_l], q_tr_mask, q_tr_circle)
+
         return p_frame
 
 def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_idx=0, object_id=1, start_frame_idx=0,
@@ -135,6 +134,7 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
             max_side = max_side
         else:
             max_side = 0.5
+
         if isinstance(max_side, int): 
             H, W = int(H * (max_side / float(min(H, W)))), int(W * (max_side / float(min(H, W))))
         else:
@@ -257,9 +257,8 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
                 session_id=session_id,
                 propagation_direction=propagation_direction,
                 start_frame_idx=start_frame_idx,
-                max_frame_num_to_track=num_frames
-            )
-        ):
+                max_frame_num_to_track=num_frames)):
+
             frame_idx = response.get("frame_idx", 0)
             outputs = response.get("outputs", {})
             obj_ids = outputs.get("out_obj_ids", None)
@@ -327,7 +326,6 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
                         )
 
                         if current_out["pred_masks"].max() < 0.0:
-
                             if warped_logits.max() > 0.0:
                                 current_out["pred_masks"] = warped_logits
                             else:
@@ -351,14 +349,14 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
                         prob_expanded = prob.unsqueeze(0) if prob.dim() == 3 else prob
                         
                         smooth_prob = torch.nn.functional.interpolate(
-                            prob_expanded, size=(H, W), mode='bicubic', align_corners=False, antialias=True
-                        ).squeeze(0)
+                            prob_expanded, size=(H, W), mode='bicubic', align_corners=False, antialias=True).squeeze(0)
                         
                         objects[frame_idx] = smooth_prob.to(dtype=torch.float32)
                         merged_prob = torch.max(smooth_prob, dim=0).values
                         merged = (merged_prob * 255).to(dtype=torch.uint8)
                         output[frame_idx] = merged
                         hard_masks.append(output)
+                        
                     else:
                         objects[frame_idx] = torch.zeros((1, H, W), dtype=torch.float32, device=tensor.device if 'tensor' in locals() else None)
                         
@@ -370,8 +368,7 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
                         mask_expanded = tensor_mask.unsqueeze(0) if tensor_mask.dim() == 3 else tensor_mask
                         
                         smooth_mask = torch.nn.functional.interpolate(
-                            mask_expanded, size=(H, W), mode='bicubic', align_corners=False, antialias=True
-                        ).squeeze(0)
+                            mask_expanded, size=(H, W), mode='bicubic', align_corners=False, antialias=True).squeeze(0)
                         
                         objects[frame_idx] = smooth_mask
                         merged_prob = torch.max(smooth_mask, dim=0).values
@@ -418,9 +415,7 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
             predictor.handle_request(
                 request=dict(
                     type="close_session",
-                    session_id=session_id,
-                )
-            )
+                    session_id=session_id))
 
         if not keep_model_loaded and close_after_propagation:
             predictor.shutdown()
@@ -513,6 +508,7 @@ batch_size=None, matte_size=None, warp=False, debug=None, sam31=False):
                 raw_frame = (frames[i] * 255).to(dtype=torch.uint8)
             else:
                 raw_frame = frames[i].to(dtype=torch.uint8)
+
             if raw_frame.shape[-1] == 3:
                 frames[i] = raw_frame[:, :, [2, 1, 0]]
             else:
@@ -583,18 +579,10 @@ def process_directory(video_path1, video_path2, output_dir, **kwargs):
 if __name__ == "__main__":
 
     INPUT_FOLDER = "assets/video_segments"
-    INPUT_FOLDER2 = "assets/video_segments2"
     OUTPUT_FOLDER = "assets/out_segments"
-
-    left_right=False 
-    alpha_pack=False 
-
-    if alpha_pack:
-        video_path1=INPUT_FOLDER
-        video_path2=INPUT_FOLDER2
-    else:
-        video_path1=INPUT_FOLDER
-        video_path2=None
+ 
+    video_path1=INPUT_FOLDER
+    video_path2=None
 
     process_directory(
         video_path1=video_path1,
@@ -604,5 +592,5 @@ if __name__ == "__main__":
         batch_size=100,
         matte_size=0.4,
         warp=False,
-        debug=100,
+        debug=None,
     )
