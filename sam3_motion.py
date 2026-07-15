@@ -19,6 +19,188 @@ def _setup_tf32() -> None:
 
 _setup_tf32()
 
+class RaftMotionCompensator:
+    def __init__(self, device=None, max_size=256, flow_scale=0.5, interp_mode="bicubic"):
+        self.device = torch.device(device) if isinstance(device, str) else (device or torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+        self.max_size = max_size
+        self.flow_scale = flow_scale
+        self.interp_mode = interp_mode
+        self.model = None
+        self.transforms = None
+
+    def _load_model(self):
+        if self.model is None:
+            if not HAS_RAFT:
+                raise ImportError("torchvision.models.optical_flow is required for RAFT.")
+            weights = Raft_Small_Weights.DEFAULT
+            self.transforms = weights.transforms()
+            self.model = raft_small(weights=weights, progress=False).to(self.device).eval()
+
+    def _compute_raft_flow(self, img1, img2):
+        oH, oW = img1.shape[2], img1.shape[3]
+        scale_factor = self.flow_scale
+        cH, cW = oH * scale_factor, oW * scale_factor
+
+        if max(cH, cW) > self.max_size:
+            scale_factor = scale_factor * (self.max_size / float(max(cH, cW)))
+
+        if scale_factor != 1.0:
+            new_H, new_W = int(oH * scale_factor), int(oW * scale_factor)
+            img1_s = F.interpolate(img1, size=(new_H, new_W), mode=self.interp_mode, antialias=True)
+            img2_s = F.interpolate(img2, size=(new_H, new_W), mode=self.interp_mode, antialias=True)
+        else:
+            img1_s, img2_s = img1, img2
+            
+        img1_t, img2_t = self.transforms(img1_s, img2_s)
+        _, _, H_s, W_s = img1_t.shape
+        pad_h, pad_w = (8 - H_s % 8) % 8, (8 - W_s % 8) % 8
+        if pad_h > 0 or pad_w > 0:
+            img1_t = F.pad(img1_t, (0, pad_w, 0, pad_h))
+            img2_t = F.pad(img2_t, (0, pad_w, 0, pad_h))
+            
+        with torch.autocast(device_type=self.device.type, enabled=False):
+            flow = self.model(img1_t.to(self.device).float(), img2_t.to(self.device).float())[-1].float()
+            
+        flow = torch.nan_to_num(flow, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if pad_h > 0 or pad_w > 0:
+            flow = flow[:, :, :H_s, :W_s]
+        if scale_factor != 1.0:
+            flow = F.interpolate(flow, size=(oH, oW), mode=self.interp_mode)
+            flow = flow / scale_factor
+
+        return flow
+
+    def _warp_frame(self, pt_frame, flow, t=1.0):
+
+        if pt_frame.ndim == 3:
+            C, H, W = pt_frame.shape
+            flow_scaled = flow * t
+            y, x = torch.meshgrid(torch.arange(H, device=self.device), torch.arange(W, device=self.device), indexing='ij')
+            x_norm = 2.0 * (x + flow_scaled[0]) / max(W - 1, 1) - 1.0
+            y_norm = 2.0 * (y + flow_scaled[1]) / max(H - 1, 1) - 1.0
+            grid = torch.stack((x_norm, y_norm), dim=-1).unsqueeze(0)
+            return F.grid_sample(pt_frame.unsqueeze(0), grid, mode='bilinear', padding_mode='border', align_corners=False).squeeze(0)
+            
+        elif pt_frame.ndim == 4:
+            N, C, H, W = pt_frame.shape
+            flow_scaled = flow * t
+            y, x = torch.meshgrid(torch.arange(H, device=self.device), torch.arange(W, device=self.device), indexing='ij')
+            x_norm = 2.0 * (x + flow_scaled[0]) / max(W - 1, 1) - 1.0
+            y_norm = 2.0 * (y + flow_scaled[1]) / max(H - 1, 1) - 1.0
+            grid = torch.stack((x_norm, y_norm), dim=-1).unsqueeze(0)
+            grid = grid.expand(N, -1, -1, -1)
+            return F.grid_sample(pt_frame, grid, mode='bilinear', padding_mode='border', align_corners=False)
+        else:
+            raise ValueError(f"Unexpected pt_frame dimensions: {pt_frame.ndim}")
+
+    def stabilize_alpha_sequence(self, rgb_frames, alpha_masks, blend_weights=(0.2, 0.6, 0.2)):
+        self._load_model()
+        is_numpy = isinstance(rgb_frames, np.ndarray)
+
+        if is_numpy:
+            t_rgb = torch.from_numpy(rgb_frames).permute(0, 3, 1, 2).float().div(255.0).to(self.device)
+            if alpha_masks.ndim == 3:
+                t_alpha = torch.from_numpy(alpha_masks).unsqueeze(1).float().div(255.0).to(self.device)
+            else:
+                t_alpha = torch.from_numpy(alpha_masks).permute(0, 3, 1, 2).float().div(255.0).to(self.device)
+        else:
+            t_rgb = rgb_frames.to(self.device).float()
+            t_alpha = alpha_masks.to(self.device).float()
+
+        num_frames = t_rgb.shape[0]
+        if num_frames < 3: return alpha_masks
+        stabilized_alphas = torch.zeros_like(t_alpha)
+        stabilized_alphas[0] = t_alpha[0]
+        stabilized_alphas[-1] = t_alpha[-1]
+        w_prev, w_curr, w_next = blend_weights
+
+        with torch.no_grad():
+            for i in tqdm(range(1, num_frames - 1)):
+                prev_rgb, curr_rgb, next_rgb = t_rgb[i-1:i+2]
+                prev_alpha, curr_alpha, next_alpha = t_alpha[i-1:i+2]
+                flow_forward = self._compute_raft_flow(prev_rgb.unsqueeze(0), curr_rgb.unsqueeze(0)).squeeze(0)
+                flow_backward = self._compute_raft_flow(next_rgb.unsqueeze(0), curr_rgb.unsqueeze(0)).squeeze(0)
+                alpha_prev_warped = self._warp_frame(prev_alpha, flow_forward, t=1.0)
+                alpha_next_warped = self._warp_frame(next_alpha, flow_backward, t=1.0)
+                merged_alpha = (w_prev * alpha_prev_warped) + (w_curr * curr_alpha) + (w_next * alpha_next_warped)
+                stabilized_alphas[i] = torch.clamp(merged_alpha, 0.0, 1.0)
+
+        if is_numpy:
+            if alpha_masks.ndim == 3:
+                return stabilized_alphas.squeeze(1).mul(255).clamp(0, 255).to(torch.uint8).cpu().numpy()
+            return stabilized_alphas.permute(0, 2, 3, 1).mul(255).clamp(0, 255).to(torch.uint8).cpu().numpy()
+        return stabilized_alphas
+
+    def interpolate_video(self, input_video, output_video, src_fps, dst_fps, width, height, encoder_opts, read_cmd=None):
+
+        self._load_model()
+        cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', input_video]
+        duration = float(subprocess.check_output(cmd).decode().strip())
+        num_src_frames = int(duration * src_fps)
+        num_dst_frames = int(duration * dst_fps)
+        step = src_fps / dst_fps
+
+        if read_cmd is None:
+            read_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", input_video, "-f", "image2pipe", "-pix_fmt", "rgb24", "-vcodec", "rawvideo", "-"]
+
+        write_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-vcodec", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", str(dst_fps), "-i", "-"] + encoder_opts + [output_video]
+        
+        buf_size = min(width * height * 3 * 2, 10 ** 8)
+        reader = subprocess.Popen(read_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=buf_size)
+        writer = subprocess.Popen(write_cmd, stdin=subprocess.PIPE, bufsize=buf_size)
+
+        def read_frame():
+            raw = reader.stdout.read(width * height * 3)
+            if not raw: return None
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
+            return torch.from_numpy(frame).permute(2, 0, 1).to(self.device).float().div(255.0)
+
+        frame_a = read_frame()
+        if frame_a is None:
+            raise RuntimeError("Failed to read any frames from FFmpeg!")
+
+        frame_b = read_frame()
+        current_idx, out_idx = 0, 0
+        with torch.no_grad():
+            with tqdm(total=num_dst_frames, unit="frame") as pbar:
+                while True:
+                    t_idx = out_idx * step
+                    while current_idx < int(t_idx) and frame_b is not None:
+                        frame_a = frame_b
+                        frame_b = read_frame()
+                        current_idx += 1
+                    if frame_b is None:
+                        if int(t_idx) > current_idx: break
+                        out_frame = frame_a
+                    else:
+                        t = float(t_idx - current_idx)
+                        if t <= 1e-6: out_frame = frame_a
+                        else:
+                            flow_fwd = self._compute_raft_flow(frame_a.unsqueeze(0), frame_b.unsqueeze(0)).squeeze(0)
+                            flow_bwd = self._compute_raft_flow(frame_b.unsqueeze(0), frame_a.unsqueeze(0)).squeeze(0)
+                            
+                            warp_a = self._warp_frame(frame_a, flow_fwd, t)
+                            warp_b = self._warp_frame(frame_b, flow_bwd, 1.0 - t)
+                            mag_fwd = torch.norm(flow_fwd, dim=0, keepdim=True)
+                            mag_bwd = torch.norm(flow_bwd, dim=0, keepdim=True)
+                            weight_a = torch.exp(-mag_fwd * 0.1) * (1.0 - t)
+                            weight_b = torch.exp(-mag_bwd * 0.1) * t
+                            Z = weight_a + weight_b
+                            mask = (Z > 1e-4).float()
+                            norm_a = torch.where(mask > 0, weight_a / (Z + 1e-8), 1.0 - t)
+                            norm_b = torch.where(mask > 0, weight_b / (Z + 1e-8), t)
+                            out_frame = torch.clamp(warp_a * norm_a + warp_b * norm_b, 0.0, 1.0)
+                            
+                    writer.stdin.write(out_frame.permute(1, 2, 0).mul(255).clamp(0, 255).to(torch.uint8).cpu().numpy().tobytes())
+                    out_idx += 1
+                    pbar.update(1)
+
+        reader.stdout.close()
+        writer.stdin.close()
+        writer.wait()
+        reader.wait()
+
 def build_sam3_video_predictor(*model_args, checkpoint_path=None, bpe_path=None, gpus_to_use=None, is_sbs=False,  max_num_objects=1, num_obj_for_compile=1, strict_state_dict_loading=False, **model_kwargs):
     from sam3.model.sam3_video_predictor import Sam3VideoPredictorMultiGPU
     predictor = Sam3VideoPredictorMultiGPU(*model_args, checkpoint_path=checkpoint_path, gpus_to_use=gpus_to_use, is_sbs=is_sbs, max_num_objects= max_num_objects, num_obj_for_compile=num_obj_for_compile, strict_state_dict_loading=strict_state_dict_loading, **model_kwargs)
@@ -73,16 +255,11 @@ class ToddPacker:
         q_bl_circle = None 
         q_br_circle = None
 
-        def blend_white_mask(roi, mask_1ch, red=True):
-            if red:
-                alpha = mask_1ch.unsqueeze(-1)
-                red_color = torch.tensor([255.0, 0.0, 0.0], dtype=torch.float32, device=roi.device)
-                x = ((1.0 - alpha) * roi.float() + alpha * red_color).to(torch.uint8)
-            else:
-                alpha = (255 - mask_1ch)[..., None]
-                blend = (roi.to(torch.int32) * alpha) // 255
-                blend += mask_1ch[..., None]
-                x = blend.to(torch.uint8)
+        def blend_mask(roi, mask_1ch):
+            alpha = (255 - mask_1ch)[..., None]
+            blend = (roi.to(torch.int32) * alpha) // 255
+            blend += mask_1ch[..., None]
+            x = blend.to(torch.uint8)
             return x
 
         y1_top = n.padding
@@ -90,34 +267,34 @@ class ToddPacker:
         x1_mid = (SBS_W // 2) - (target_w // 2)
         x2_mid = x1_mid + target_w
 
-        p_frame[y1_top:y2_top, x1_mid:x2_mid] = blend_white_mask(p_frame[y1_top:y2_top, x1_mid:x2_mid], bottom_half_mask)
+        p_frame[y1_top:y2_top, x1_mid:x2_mid] = blend_mask(p_frame[y1_top:y2_top, x1_mid:x2_mid], bottom_half_mask)
         y1_bot = H - n.padding - h_half
         y2_bot = y1_bot + h_half
-        p_frame[y1_bot:y2_bot, x1_mid:x2_mid] = blend_white_mask(p_frame[y1_bot:y2_bot, x1_mid:x2_mid], top_half_mask)
+        p_frame[y1_bot:y2_bot, x1_mid:x2_mid] = blend_mask(p_frame[y1_bot:y2_bot, x1_mid:x2_mid], top_half_mask)
 
         y1_tr = n.padding
         y2_tr = y1_tr + h_half
         x1_tr = SBS_W - n.padding - w_half
         x2_tr = SBS_W - n.padding
-        p_frame[y1_tr:y2_tr, x1_tr:x2_tr] = blend_white_mask(p_frame[y1_tr:y2_tr, x1_tr:x2_tr], q_bl_mask, q_bl_circle)
+        p_frame[y1_tr:y2_tr, x1_tr:x2_tr] = blend_mask(p_frame[y1_tr:y2_tr, x1_tr:x2_tr], q_bl_mask)
 
         y1_tl_l = n.padding
         y2_tl_l = y1_tl_l + h_half
         x1_tl_l = n.padding
         x2_tl_l = n.padding + w_half
-        p_frame[y1_tl_l:y2_tl_l, x1_tl_l:x2_tl_l] = blend_white_mask(p_frame[y1_tl_l:y2_tl_l, x1_tl_l:x2_tl_l], q_br_mask, q_br_circle)
+        p_frame[y1_tl_l:y2_tl_l, x1_tl_l:x2_tl_l] = blend_mask(p_frame[y1_tl_l:y2_tl_l, x1_tl_l:x2_tl_l], q_br_mask)
 
         y1_br_r = H - n.padding - h_half
         y2_br_r = y1_br_r + h_half
         x1_br_r = SBS_W - n.padding - w_half
         x2_br_r = SBS_W - n.padding
-        p_frame[y1_br_r:y2_br_r, x1_br_r:x2_br_r] = blend_white_mask(p_frame[y1_br_r:y2_br_r, x1_br_r:x2_br_r], q_tl_mask, q_tl_circle)
+        p_frame[y1_br_r:y2_br_r, x1_br_r:x2_br_r] = blend_mask(p_frame[y1_br_r:y2_br_r, x1_br_r:x2_br_r], q_tl_mask)
 
         y1_bl_l = H - n.padding - h_half
         y2_bl_l = y1_bl_l + h_half
         x1_bl_l = n.padding
         x2_bl_l = n.padding + w_half
-        p_frame[y1_bl_l:y2_bl_l, x1_bl_l:x2_bl_l] = blend_white_mask(p_frame[y1_bl_l:y2_bl_l, x1_bl_l:x2_bl_l], q_tr_mask, q_tr_circle)
+        p_frame[y1_bl_l:y2_bl_l, x1_bl_l:x2_bl_l] = blend_mask(p_frame[y1_bl_l:y2_bl_l, x1_bl_l:x2_bl_l], q_tr_mask)
 
         return p_frame
 
@@ -345,7 +522,7 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
                         prob = torch.sigmoid(tensor)
                         prob_expanded = prob.unsqueeze(0) if prob.dim() == 3 else prob
                         
-                        smooth_prob = torch.nn.functional.interpolate(
+                        smooth_prob = F.interpolate(
                             prob_expanded, size=(H, W), mode='bicubic', align_corners=False, antialias=True).squeeze(0)
                         
                         objects[frame_idx] = smooth_prob.to(dtype=torch.float32)
@@ -364,7 +541,7 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
                         tensor_mask = torch.from_numpy(mask).float() if isinstance(mask, np.ndarray) else mask.float()
                         mask_expanded = tensor_mask.unsqueeze(0) if tensor_mask.dim() == 3 else tensor_mask
                         
-                        smooth_mask = torch.nn.functional.interpolate(
+                        smooth_mask = F.interpolate(
                             mask_expanded, size=(H, W), mode='bicubic', align_corners=False, antialias=True).squeeze(0)
                         
                         objects[frame_idx] = smooth_mask
@@ -419,8 +596,8 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
 
     return output
 
-def process_allthethings(video_path1, video_path2, out_path, mask_path, prompt_text=None, 
-batch_size=None, matte_size=None, warp=False, debug=None, sam31=False):  
+def process_allthethings(video_path1, video_path2, out_path, mask_path=None, red_path=None, prompt_text=None, 
+batch_size=None, matte_size=None, warp=False, debug=None, sam31=False, red=True):  
 
     if sam31:
         origin_ckpt = torch.load("assets/sam3.1_multiplex.pt")
@@ -472,6 +649,7 @@ batch_size=None, matte_size=None, warp=False, debug=None, sam31=False):
 
     writer = ffmpeg_pipe(out_path, width, height, fps, audio_source=video_path1) if out_path else None
     mask_writer = ffmpeg_pipe(mask_path, width, height, fps) if mask_path else None
+    red_writer = ffmpeg_pipe(red_path, width, height, fps) if red_path else None
     packer = ToddPacker(scale=matte_size, circle=False)
 
     frame_count = 0
@@ -497,7 +675,7 @@ batch_size=None, matte_size=None, warp=False, debug=None, sam31=False):
         
         masks_l = process_frames(predictor, frames=[f[:, :half_w] for f in frames], prompt_text=prompt_text, max_frames_to_track=max_track, frame_idx=frame_count, warp=raft)
         masks_r = process_frames(predictor, frames=[f[:, half_w:] for f in frames], prompt_text=prompt_text, max_frames_to_track=max_track, frame_idx=frame_count, warp=raft)
-            
+               
         for i in range(chunk):
             if frames[i].max() <= 1.0:
                 raw_frame = (frames[i] * 255).to(dtype=torch.uint8)
@@ -514,8 +692,15 @@ batch_size=None, matte_size=None, warp=False, debug=None, sam31=False):
             mask_h, mask_w = masks_l[i].shape
             ml_4d = masks_l[i].unsqueeze(0).unsqueeze(0).to(dtype=torch.float32)
             mr_4d = masks_r[i].unsqueeze(0).unsqueeze(0).to(dtype=torch.float32)
-            smooth_ml = torch.nn.functional.interpolate(ml_4d, size=(height, height), mode='bicubic', antialias=True).squeeze()
-            smooth_mr = torch.nn.functional.interpolate(mr_4d, size=(height, height), mode='bicubic', antialias=True).squeeze()
+            smooth_ml = F.interpolate(ml_4d, size=(height, height), mode='bicubic', antialias=True).squeeze()
+            smooth_mr = F.interpolate(mr_4d, size=(height, height), mode='bicubic', antialias=True).squeeze()
+
+            if red:
+                red_sbs = torch.zeros((height, width, 3), dtype=torch.uint8)
+                red_sbs[:, :half_w, 2] = smooth_ml
+                red_sbs[:, half_w:, 2] = smooth_mr
+                red_writer.stdin.write(red_sbs.cpu().contiguous().numpy().tobytes())
+
             gray_sbs = torch.cat([smooth_ml, smooth_mr], dim=1).to(dtype=torch.uint8)
             white_sbs = torch.stack([gray_sbs, gray_sbs, gray_sbs], dim=-1)
             mask_writer.stdin.write(white_sbs.cpu().contiguous().numpy().tobytes())
@@ -530,6 +715,10 @@ batch_size=None, matte_size=None, warp=False, debug=None, sam31=False):
     if mask_writer is not None:
         mask_writer.stdin.close()
         mask_writer.wait()
+
+    if red_writer is not None:
+        red_writer.stdin.close()
+        red_writer.wait()
         
 def process_directory(video_path1, video_path2, output_dir, **kwargs):
     os.makedirs(output_dir, exist_ok=True)
@@ -550,6 +739,7 @@ def process_directory(video_path1, video_path2, output_dir, **kwargs):
         base_name = os.path.splitext(filename)[0]
         out_path = os.path.join(output_dir, f"{base_name}_ALPHA.mp4")
         mask_path = os.path.join(output_dir, f"{base_name}_mask.mp4")
+        red_path = os.path.join(output_dir, f"{base_name}_redmask.mp4")
         packed = os.path.join(output_dir, f"{base_name}_XALPHA.mp4")
         v_path2 = os.path.join(video_path2, filename) if video_path2 else None
         
@@ -569,6 +759,7 @@ def process_directory(video_path1, video_path2, output_dir, **kwargs):
             video_path2=v_path2,
             out_path=out_path,
             mask_path=mask_path,
+            red_path=red_path,
             **kwargs)
 
 if __name__ == "__main__":
@@ -584,8 +775,8 @@ if __name__ == "__main__":
         video_path2=video_path2,
         output_dir=OUTPUT_FOLDER,        
         prompt_text="One girl",
-        batch_size=100,
+        batch_size=5,
         matte_size=0.4,
         warp=False,
-        debug=None,
+        debug=5,
     )
