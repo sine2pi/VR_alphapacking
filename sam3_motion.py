@@ -1,9 +1,8 @@
 
-from huggingface_hub import hf_hub_download
 from torch import set_default_dtype
 from masksandthings import *
-import torchvision.transforms.functional as TVF
 import torch.nn.functional as F
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
 set_default_dtype(dtype)
@@ -58,8 +57,8 @@ class AlphaPacker:
         target_h = int(H * n.scale)
 
         if mask_l.shape[1] != target_h or mask_l.shape[2] != target_w:
-            mask_l = F.interpolate(mask_l.unsqueeze(0).unsqueeze(0), size=(target_h, target_w), mode='bicubic', antialias=True).squeeze(0).squeeze(0)
-            mask_r = F.interpolate(mask_r.unsqueeze(0).unsqueeze(0), size=(target_h, target_w), mode='bicubic', antialias=True).squeeze(0).squeeze(0)
+            mask_l = F.interpolate(mask_l.unsqueeze(0).unsqueeze(0), size=(target_h, target_w), mode='area').squeeze(0).squeeze(0)
+            mask_r = F.interpolate(mask_r.unsqueeze(0).unsqueeze(0), size=(target_h, target_w), mode='area').squeeze(0).squeeze(0)
 
         p_frame = frames
         h_half = target_h // 2
@@ -276,10 +275,8 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
                 state = states[0]
                 tensors_rgb = []
 
-                for f_bgr in frames:
-                    f_rgb = cv2.cvtColor(f_bgr, cv2.COLOR_BGR2RGB)
-                    t_rgb = torch.from_numpy(f_rgb).permute(2, 0, 1).float().div(255.0).to(device)
-                    tensors_rgb.append(t_rgb)
+                for f in frames:
+                    tensors_rgb.append(f)
 
                 prev_logits = state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].to(device).float()
                 batch_size = len(state["obj_ids"])
@@ -505,7 +502,7 @@ batch_size=None, matte_size=None, warp=False, debug=None, sam31=False):
             break
 
         chunk = len(frames) 
-        print(f"Processing chunk of {chunk} frames, total processed: {frame_count}/{total_frames} Frame shape {frames[0].shape}")
+        print(f"Processing batch of {chunk} frames, total processed: {frame_count}/{total_frames} Frame shape {frames[0].shape}")
         max_track = total_frames - frame_count
         
         masks_l = process_frames(predictor, frames=[f[:, :half_w] for f in frames], prompt_text=prompt_text, max_frames_to_track=max_track, frame_idx=frame_count, warp=raft)
