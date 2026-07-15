@@ -19,7 +19,7 @@ def _setup_tf32() -> None:
 
 _setup_tf32()
 
-def build_sam3_video_predictor(*model_args, checkpoint_path=None, bpe_path=None, gpus_to_use=None, is_sbs=False,  max_num_objects=1, num_obj_for_compile=1, strict_state_dict_loading=False, **model_kwargs):
+def build_sam3_video_predictor(*model_args, checkpoint_path=None, bpe_path=None, gpus_to_use=None, is_sbs=False, max_num_objects=1, num_obj_for_compile=1, strict_state_dict_loading=False, **model_kwargs):
     from sam3.model.sam3_video_predictor import Sam3VideoPredictorMultiGPU
     predictor = Sam3VideoPredictorMultiGPU(*model_args, checkpoint_path=checkpoint_path, gpus_to_use=gpus_to_use, is_sbs=is_sbs, max_num_objects= max_num_objects, num_obj_for_compile=num_obj_for_compile, strict_state_dict_loading=strict_state_dict_loading, **model_kwargs)
     return predictor
@@ -38,12 +38,13 @@ def ffmpeg_pipe(out_path, width, height, fps, audio_source=None):
     return subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 class ToddPacker:
-    def __init__(n, scale=0.40, padding=0, circle=False):
+    def __init__(n, scale=0.40, padding=0, circle=False, color="red"):
 
         n.scale = scale
         n.padding = padding
         n.circle = circle
         n._cache = None
+        n.color=color
 
     def pack_frame(n, frames, mask_l = None, mask_r = None):
 
@@ -73,10 +74,17 @@ class ToddPacker:
         q_bl_circle = None 
         q_br_circle = None
 
-        def blend_mask(roi, mask_1ch):
+        def blend_mask(roi, mask_1ch, color=n.color):
+
             alpha = (255 - mask_1ch)[..., None]
             blend = (roi.to(torch.int32) * alpha) // 255
-            blend += mask_1ch[..., None]
+            
+            if color == "red":
+                zeros = torch.zeros_like(mask_1ch)
+                mask_3d = torch.stack([zeros, zeros, mask_1ch], dim=-1)
+                blend += mask_3d
+            else:
+                blend += mask_1ch[..., None]
             x = blend.to(torch.uint8)
             return x
 
@@ -118,10 +126,9 @@ class ToddPacker:
 
 def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_idx=0, object_id=1, start_frame_idx=0,
  max_frames_to_track=-1, close_after_propagation=True, keep_model_loaded=True, session_id=None, prev_mask=None, positive_coords=None, 
- negative_coords=None, bbox=None, propagation_direction="forward", sam31=False, warp=None, prev_frame=None, matte_size=None, prev_flow=None, max_side=1.0, objects_out=False):
+ negative_coords=None, bbox=None, propagation_direction="forward", sam31=False, warp=None, prev_frame=None, matte_size=None, prev_flow=None, max_side=2048, objects_out=False):
 
-    H, W, C = int(frames[0].shape[0]), int(frames[0].shape[1]), int(frames[0].shape[2])  
-
+    H, W, C = frames[0].shape
     if max_side is not None:
         if min(H, W) < 4096:
             max_side = max_side
@@ -129,7 +136,8 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
             max_side = 0.5
 
         if isinstance(max_side, int): 
-            H, W = int(H * (max_side / float(min(H, W)))), int(W * (max_side / float(min(H, W))))
+            scale = max_side / float(min(H, W))
+            H, W = int(H * scale), int(W * scale)
         else:
             H, W = int(max_side * H), int(max_side * W)
     else:
@@ -140,7 +148,7 @@ def process_frames(predictor, frames, frames_pil=None, prompt_text=None, frame_i
     else: 
         frames = [(f).permute(2, 0, 1).float().unsqueeze(0) for f in frames]
 
-    frames = [F.interpolate(f, size=(H, W), mode='bicubic', antialias=True) for f in frames] if aorb(max_side, 1.0) else frames
+    frames = [F.interpolate(f, size=(H, W), mode='area', antialias=False) for f in frames] if aorb(max_side, 1.0) else frames
     frames_pil = [Image.fromarray((f.squeeze(0).permute(1, 2, 0).cpu().numpy() * (255 if f.max() <= 1.0 else 1)).astype('uint8')) for f in frames]
     B, C, H, W = frames[0].shape
 
@@ -447,8 +455,8 @@ batch_size=None, matte_size=None, warp=False, debug=None, sam31=False, red=True)
 
     else:
         predictor = build_sam3_video_predictor(
-            # checkpoint_path = "assets/sam3.pt",
-            # bpe_path="assets/bpe_simple_vocab_16e6.txt.gz",
+            checkpoint_path = "assets/sam3.pt",
+            bpe_path="assets/bpe_simple_vocab_16e6.txt.gz",
             gpus_to_use = None,
             has_presence_token = False,
             geo_encoder_use_img_cross_attn = False,
@@ -468,7 +476,8 @@ batch_size=None, matte_size=None, warp=False, debug=None, sam31=False, red=True)
     writer = ffmpeg_pipe(out_path, width, height, fps, audio_source=video_path1) if out_path else None
     mask_writer = ffmpeg_pipe(mask_path, width, height, fps) if mask_path else None
     red_writer = ffmpeg_pipe(red_path, width, height, fps) if red_path else None
-    packer = ToddPacker(scale=matte_size, circle=False)
+    
+    packer = ToddPacker(scale=matte_size, circle=False, color="red")
 
     frame_count = 0
     total_frames = total_frames if debug is None else debug
@@ -506,22 +515,21 @@ batch_size=None, matte_size=None, warp=False, debug=None, sam31=False, red=True)
                 frames[i] = raw_frame
 
             p_frame = packer.pack_frame(frames[i], masks_l[i], masks_r[i])
-            writer.stdin.write(p_frame.to(dtype=torch.uint8).cpu().contiguous().numpy().tobytes())
+            writer.stdin.write(p_frame.cpu().contiguous().numpy().tobytes())
             mask_h, mask_w = masks_l[i].shape
             ml_4d = masks_l[i].unsqueeze(0).unsqueeze(0).to(dtype=torch.float32)
             mr_4d = masks_r[i].unsqueeze(0).unsqueeze(0).to(dtype=torch.float32)
-            smooth_ml = F.interpolate(ml_4d, size=(height, height), mode='bicubic', antialias=True).squeeze()
-            smooth_mr = F.interpolate(mr_4d, size=(height, height), mode='bicubic', antialias=True).squeeze()
-
+            smooth_ml = F.interpolate(ml_4d, size=(height, height), mode='bicubic').squeeze()
+            smooth_mr = F.interpolate(mr_4d, size=(height, height), mode='bicubic').squeeze()
+            gray_sbs = torch.cat([smooth_ml, smooth_mr], dim=1)
+            white_sbs = torch.stack([gray_sbs, gray_sbs, gray_sbs], dim=-1)
+            mask_writer.stdin.write(white_sbs.cpu().contiguous().numpy().tobytes())
+            
             if red:
                 red_sbs = torch.zeros((height, width, 3), dtype=torch.uint8)
                 red_sbs[:, :half_w, 2] = smooth_ml
                 red_sbs[:, half_w:, 2] = smooth_mr
                 red_writer.stdin.write(red_sbs.cpu().contiguous().numpy().tobytes())
-
-            gray_sbs = torch.cat([smooth_ml, smooth_mr], dim=1).to(dtype=torch.uint8)
-            white_sbs = torch.stack([gray_sbs, gray_sbs, gray_sbs], dim=-1)
-            mask_writer.stdin.write(white_sbs.cpu().contiguous().numpy().tobytes())
 
         frame_count += chunk
         pbar.update(chunk)
@@ -555,7 +563,7 @@ def process_directory(video_path1, video_path2, output_dir, **kwargs):
     for i, v_path1 in enumerate(video_files):
         filename = os.path.basename(v_path1)
         base_name = os.path.splitext(filename)[0]
-        out_path = os.path.join(output_dir, f"{base_name}_ALPHA.mp4")
+        out_path = os.path.join(output_dir, f"{base_name}_FE180_SBS_FISHEYE_180_LR_ALPHA.mp4")
         mask_path = os.path.join(output_dir, f"{base_name}_mask.mp4")
         red_path = os.path.join(output_dir, f"{base_name}_redmask.mp4")
         packed = os.path.join(output_dir, f"{base_name}_XALPHA.mp4")
@@ -593,8 +601,8 @@ if __name__ == "__main__":
         video_path2=video_path2,
         output_dir=OUTPUT_FOLDER,        
         prompt_text="One girl",
-        batch_size=5,
+        batch_size=100,
         matte_size=0.4,
         warp=False,
-        debug=5,
+        debug=None,
     )
